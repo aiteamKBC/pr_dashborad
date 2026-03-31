@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+
+# Frontend env
+.env.local
+.env.*.local
+
+# Backend env and cache
+backend/.env
+backend/__pycache__/
+backend/**/__pycache__/
+backend/db.sqlite3
