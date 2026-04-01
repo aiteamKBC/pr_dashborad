@@ -2522,7 +2522,7 @@ export default function ProgressReviewPage() {
                 </span>
               </div>
               <h1 className="mt-2 text-[32px] font-black leading-[0.95] tracking-[-0.04em] text-slate-950 sm:text-[40px]">
-                Progress Review
+                Progress Review Report
               </h1>
               <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-500 sm:text-[15px]">
                 <span className="inline-flex items-center gap-2 font-medium text-slate-600">
