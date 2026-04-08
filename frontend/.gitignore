@@ -3,6 +3,8 @@ dist/
 .DS_Store
 
 # Frontend env
+.env
+.env.production
 .env.local
 .env.*.local
 
