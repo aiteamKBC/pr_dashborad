@@ -27,6 +27,7 @@ import Card from '../../../shared/components/Card';
 import Badge from '../../../shared/components/Badge';
 import { useToast } from '../../../shared/hooks/useToast';
 import { calculateComplianceScore, calculateRiskFlags, getStatusBadgeColor, formatRiskFlag, getRiskBadgeColor } from '../../../shared/utils/review-calculations';
+import kentBusinessCollegeLogo from '../../../assets/image.png';
 import type { NotificationType, NotificationPriority } from '../../../shared/types/notification';
 import type { SystemSettings } from '../../../shared/types/settings';
 import type { LearnerListParams } from '../../../shared/types/learner';
@@ -107,7 +108,7 @@ const FORM_SECTIONS = [
 ];
 
 // ─── Main Component ───────────────────────────────────────────────────────────
-const LOGO_SOURCES = ['https://kentbusinesscollege.com/wp-content/uploads/2025/12/header-logo-e1756282001779.png'];
+const LOGO_SOURCES = [kentBusinessCollegeLogo];
 
 export default function MainPage() {
   const [activeTab, setActiveTab] = useState<Tab>('dashboard');

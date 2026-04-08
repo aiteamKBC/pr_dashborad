@@ -18,6 +18,7 @@ import {
 import type { ReviewRecord, ReviewStatus, ChecklistStatus, ContactOutcome } from '../../types/progress-review';
 import LearnerDetailPage from './components/LearnerDetailPage';
 import ErrorBoundary from '../../shared/components/ErrorBoundary';
+import kentBusinessCollegeLogo from '../../assets/image.png';
 
 type ProgressReviewsOverviewResponse = {
   table: string;
@@ -125,6 +126,7 @@ const KPI_STYLES = {
 
 type KPIColor = keyof typeof KPI_STYLES;
 type DashboardDatePreset = 'ALL' | 'LAST_MONTH' | 'LAST_3_MONTHS' | 'CUSTOM';
+type ReportDatePreset = 'LAST_MONTH' | 'LAST_3_MONTHS' | 'DAY';
 type ChecklistCellEvidenceItem = {
   learnerName: string;
   category: string;
@@ -457,7 +459,7 @@ function formatDurationMinutes(value?: number | null) {
   return `${Math.round(value)} min`;
 }
 
-const QA_REPORT_TITLE = 'TRIPARTITE PROGRESS REVIEW - QA CHECKLIST';
+const QA_REPORT_TITLE = 'PROGRESS REVIEW REPORT';
 const QA_REPORT_CRITERIA = [
   {
     category: 'Review within timeframe',
@@ -723,6 +725,7 @@ export default function ProgressReviewPage() {
   const apiBase = apiBaseRaw.endsWith('/api/v1')
     ? apiBaseRaw
     : `${apiBaseRaw.replace(/\/$/, '')}/api/v1`;
+  const reviewRequestTimeoutMs = 15000;
 
   const [reviews, setReviews] = useState<ReviewRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -742,6 +745,8 @@ export default function ProgressReviewPage() {
   const [showSessionReportModal, setShowSessionReportModal] = useState(false);
   const [activeReportId, setActiveReportId] = useState<string | null>(null);
   const [reportCoachFilter, setReportCoachFilter] = useState<string>('');
+  const [reportDatePreset, setReportDatePreset] = useState<ReportDatePreset>('LAST_MONTH');
+  const [reportDateFilter, setReportDateFilter] = useState('');
   const [dashboardCoachFilter, setDashboardCoachFilter] = useState('');
   const [dashboardDatePreset, setDashboardDatePreset] = useState<DashboardDatePreset>('ALL');
   const [dashboardDateFrom, setDashboardDateFrom] = useState('');
@@ -771,10 +776,7 @@ export default function ProgressReviewPage() {
     }
   });
   const [openContactDropdownId, setOpenContactDropdownId] = useState<string | null>(null);
-  const [logoIndex, setLogoIndex] = useState(0);
-  const logoSources = ['https://kentbusinesscollege.com/wp-content/uploads/2025/12/header-logo-e1756282001779.png'];
-  const logoLoadFailed = logoIndex >= logoSources.length;
-  const reportLogoSrc = logoSources[0];
+  const reportLogoSrc = kentBusinessCollegeLogo;
 
   const normalizeAptimText = (value: string) =>
     value.replace(/\b(?:aptin|aptim|aptem|uptem)\b/gi, 'aptem');
@@ -960,9 +962,11 @@ export default function ProgressReviewPage() {
 
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), reviewRequestTimeoutMs);
     setLoading(true);
     setLoadError(null);
-    fetch(`${apiBase}/progress-reviews/overview?limit=all`)
+    fetch(`${apiBase}/progress-reviews/overview?limit=all`, { signal: controller.signal })
       .then(async (res) => {
         if (!res.ok) {
           const msg = await res.text();
@@ -979,17 +983,24 @@ export default function ProgressReviewPage() {
       })
       .catch((err: Error) => {
         if (!active) return;
-        setLoadError(err.message || 'Failed to load reviews');
+        const message =
+          err.name === 'AbortError'
+            ? `Request timed out after ${Math.round(reviewRequestTimeoutMs / 1000)} seconds. Check that the API is running at ${apiBase}.`
+            : err.message || 'Failed to load reviews';
+        setLoadError(message);
       })
       .finally(() => {
         if (!active) return;
+        window.clearTimeout(timeoutId);
         setLoading(false);
       });
 
     return () => {
       active = false;
+      window.clearTimeout(timeoutId);
+      controller.abort();
     };
-  }, [apiBase]);
+  }, [apiBase, reviewRequestTimeoutMs]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1454,17 +1465,49 @@ export default function ProgressReviewPage() {
     [reviews]
   );
 
+  const dateFilteredReportSessions = useMemo(
+    () => {
+      const endOfToday = new Date();
+      endOfToday.setHours(23, 59, 59, 999);
+
+      const startOfDay = (value: string) => {
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return null;
+        date.setHours(0, 0, 0, 0);
+        return date;
+      };
+
+      return reportSessions.filter((review) => {
+        const rawDate = review.meetingDate || review.lastReviewDate || '';
+        const sourceDate = rawDate ? new Date(rawDate) : null;
+        if (!sourceDate || Number.isNaN(sourceDate.getTime())) return false;
+
+        if (reportDatePreset === 'DAY') {
+          if (!reportDateFilter) return true;
+          return rawDate.slice(0, 10) === reportDateFilter;
+        }
+
+        const rangeStart = new Date(endOfToday);
+        rangeStart.setMonth(rangeStart.getMonth() - (reportDatePreset === 'LAST_3_MONTHS' ? 3 : 1));
+        rangeStart.setHours(0, 0, 0, 0);
+
+        return sourceDate >= rangeStart && sourceDate <= endOfToday;
+      });
+    },
+    [reportSessions, reportDateFilter, reportDatePreset]
+  );
+
   const reportCoachOptions = useMemo(
-    () => Array.from(new Set(reportSessions.map((r) => r.coach.name || 'Unknown Coach'))).sort(),
-    [reportSessions]
+    () => Array.from(new Set(dateFilteredReportSessions.map((r) => r.coach.name || 'Unknown Coach'))).sort(),
+    [dateFilteredReportSessions]
   );
 
   const coachFilteredReportSessions = useMemo(
     () =>
       !reportCoachFilter
         ? []
-        : reportSessions.filter((r) => (r.coach.name || 'Unknown Coach') === reportCoachFilter),
-    [reportSessions, reportCoachFilter]
+        : dateFilteredReportSessions.filter((r) => (r.coach.name || 'Unknown Coach') === reportCoachFilter),
+    [dateFilteredReportSessions, reportCoachFilter]
   );
 
   const activeReportReview = useMemo(() => {
@@ -2146,28 +2189,26 @@ export default function ProgressReviewPage() {
     return 'text-cyan-700 font-medium';
   };
 
-  const handleExportSessionReport = async () => {
+  const handleExportSessionReport = () => {
     setSessionReportLoading(true);
     setSessionReportError(null);
+
     try {
-      const res = await fetch(`${apiBase}/progress-reviews/session-report?limit=all`);
-      if (!res.ok) {
-        throw new Error(`Failed to generate report (${res.status})`);
+      if (!reportSessions.length) {
+        throw new Error('No progress review sessions are available yet.');
       }
-      const data = (await res.json()) as SessionReportResponse;
+
       const generatedAt = new Date().toLocaleString('en-GB');
-      const reportBody =
-        data.reportText && data.reportText.trim().length > 0
-          ? normalizeAptimText(data.reportText)
-          : `Session Report\nTotal sessions: ${data.summary?.totalSessions ?? 0}`;
-      const text = `${reportBody}\n\nGenerated at: ${generatedAt}\n`;
-      setSessionReportText(text);
+
+      setSessionReportText(`Session Report\nGenerated at: ${generatedAt}\n`);
       setSessionReportMeta({
-        totalSessions: data.summary?.totalSessions ?? data.sourceCount ?? 0,
-        uniqueLearners: data.summary?.uniqueLearners ?? 0,
-        uniqueCoaches: data.summary?.uniqueCoaches ?? 0,
-        compliance: Math.round(data.summary?.checklistWeightedCompliancePercent ?? 0),
+        totalSessions: reportSessions.length,
+        uniqueLearners: new Set(reportSessions.map((review) => review.learner.id)).size,
+        uniqueCoaches: new Set(reportSessions.map((review) => review.coach.name || 'Unknown Coach')).size,
+        compliance: 0,
       });
+      setReportDatePreset('LAST_MONTH');
+      setReportDateFilter('');
       setReportCoachFilter('');
       setActiveReportId(null);
       setShowSessionReportModal(true);
@@ -2177,6 +2218,24 @@ export default function ProgressReviewPage() {
     } finally {
       setSessionReportLoading(false);
     }
+  };
+
+  const openReportForReview = (review: ReviewRecord) => {
+    const generatedAt = new Date().toLocaleString('en-GB');
+    const reviewDate = (review.meetingDate || review.lastReviewDate || '').slice(0, 10);
+
+    setSessionReportText(`Session Report\nGenerated at: ${generatedAt}\n`);
+    setSessionReportMeta({
+      totalSessions: reportSessions.length,
+      uniqueLearners: new Set(reportSessions.map((item) => item.learner.id)).size,
+      uniqueCoaches: new Set(reportSessions.map((item) => item.coach.name || 'Unknown Coach')).size,
+      compliance: 0,
+    });
+    setReportDatePreset('DAY');
+    setReportDateFilter(reviewDate);
+    setReportCoachFilter(review.coach.name || '');
+    setActiveReportId(review.id);
+    setShowSessionReportModal(true);
   };
 
   const escapeHtml = (value: string) =>
@@ -2354,7 +2413,7 @@ export default function ProgressReviewPage() {
         ).join('');
         return `
           <section class="report-page ${index > 0 ? 'page-break' : ''}">
-            <div class="report-kicker">Quality Assurance Review Record</div>
+            <div class="report-kicker">Progress Review Record</div>
             <div class="report-header">
               <div class="logo-box">
                 <img src="${escapeHtml(reportLogoSrc)}" alt="Kent Business College logo" />
@@ -2421,9 +2480,9 @@ export default function ProgressReviewPage() {
             .report-page { margin-bottom: 18px; background: #ffffff; border: 1px solid #cbd5e1; padding: 14px 16px 16px; box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08); }
             .page-break { page-break-before: always; }
             .report-kicker { margin-bottom: 8px; font-size: 10px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; color: #64748b; }
-            .report-header { display: grid; grid-template-columns: 165px 1fr; align-items: center; border: 1px solid #94a3b8; border-radius: 14px; overflow: hidden; margin-bottom: 14px; }
+            .report-header { display: grid; grid-template-columns: 250px 1fr; align-items: center; border: 1px solid #94a3b8; border-radius: 14px; overflow: hidden; margin-bottom: 14px; }
             .logo-box { height: 90px; display: flex; align-items: center; justify-content: center; padding: 8px 8px; border-right: 1px solid #94a3b8; background: #ffffff; }
-            .logo-box img { width: 100%; max-width: 190px; max-height: 82px; object-fit: contain; object-position: center; }
+            .logo-box img { width: 100%; max-width: 258px; max-height: 134px; object-fit: contain; object-position: center; }
             .title-box { padding: 12px 16px; }
             .report-subtitle { margin: 0 0 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: #64748b; }
             .title-box h1 { margin: 0; font-size: 24px; line-height: 1.15; color: #0f172a; }
@@ -2508,11 +2567,11 @@ export default function ProgressReviewPage() {
           <div className="pointer-events-none absolute inset-y-0 left-0 w-40 bg-[radial-gradient(circle_at_left,_rgba(14,165,233,0.14),_transparent_70%)]" />
           <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
           <div className="min-w-0 flex items-center gap-4 sm:gap-5">
-            <div className="relative shrink-0 rounded-[24px] border border-cyan-100 bg-gradient-to-br from-cyan-50 via-white to-sky-50 p-2.5 shadow-sm">
+            <div className="relative shrink-0 rounded-[26px] border border-cyan-100 bg-gradient-to-br from-cyan-50 via-white to-sky-50 p-1 shadow-sm">
               <img
-                src={logoSources[0]}
+                src={reportLogoSrc}
                 alt="Kent Business College logo"
-                className="h-16 w-auto object-contain sm:h-[74px]"
+                className="h-28 w-auto object-contain sm:h-[118px]"
               />
             </div>
             <div className="min-w-0 flex min-h-16 flex-col justify-center">
@@ -3329,11 +3388,11 @@ export default function ProgressReviewPage() {
             <div className="pointer-events-none absolute inset-y-0 left-0 w-40 bg-[radial-gradient(circle_at_left,_rgba(14,165,233,0.14),_transparent_70%)]" />
             <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
               <div className="min-w-0 flex items-center gap-4 sm:gap-5">
-                <div className="relative shrink-0 rounded-[24px] border border-cyan-100 bg-gradient-to-br from-cyan-50 via-white to-sky-50 p-2.5 shadow-sm">
+                <div className="relative shrink-0 rounded-[26px] border border-cyan-100 bg-gradient-to-br from-cyan-50 via-white to-sky-50 p-1 shadow-sm">
                   <img
-                    src={logoSources[0]}
+                    src={reportLogoSrc}
                     alt="Kent Business College logo"
-                    className="h-16 w-auto object-contain sm:h-[74px]"
+                    className="h-28 w-auto object-contain sm:h-[118px]"
                   />
                 </div>
                 <div className="min-w-0 flex min-h-16 flex-col justify-center">
@@ -3343,7 +3402,7 @@ export default function ProgressReviewPage() {
                     </span>
                   </div>
                   <h1 className="mt-2 text-[32px] font-black leading-[0.95] tracking-[-0.04em] text-slate-950 sm:text-[40px]">
-                    Progress Review
+                    Progress Review Report
                   </h1>
                   <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-500 sm:text-[15px]">
                     <span className="inline-flex items-center gap-2 font-medium text-slate-600">
@@ -3524,6 +3583,16 @@ export default function ProgressReviewPage() {
                         <div><span className="font-semibold text-slate-700">Meeting:</span> {format(new Date(review.meetingDate || review.lastReviewDate), 'dd MMM yyyy')}</div>
                         <div className="break-words"><span className="font-semibold text-slate-700">Manager:</span> {review.employer?.name || '-'}</div>
                       </div>
+                      <div className="mt-3">
+                        <button
+                          type="button"
+                          onClick={() => openReportForReview(review)}
+                          className="inline-flex items-center gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2 text-[12px] font-semibold text-cyan-700 transition hover:bg-cyan-100"
+                        >
+                          <i className="ri-file-text-line"></i>
+                          Open report
+                        </button>
+                      </div>
                     </div>
                   </div>
 
@@ -3577,10 +3646,12 @@ export default function ProgressReviewPage() {
                   return (
                   <tr key={review.id} className={rowSurface}>
                     <td className={`sticky left-0 z-10 w-[21%] px-4 py-4 align-top shadow-[8px_0_18px_rgba(15,23,42,0.04)] ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
-                      <button
-                        onClick={() => setSelectedLearnerId(review.learner.id)}
-                        className="w-full text-left cursor-pointer"
-                      >
+                      <div className="w-full text-left">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedLearnerId(review.learner.id)}
+                          className="w-full text-left cursor-pointer"
+                        >
                         <div className="flex items-start justify-between gap-3">
                           <div className="text-[13px] font-semibold text-violet-700 break-words">{review.learner.name}</div>
                           <span className="rounded-full border border-violet-100 bg-violet-50 px-2 py-0.5 text-[10px] font-bold text-violet-700">
@@ -3596,7 +3667,16 @@ export default function ProgressReviewPage() {
                             <div className="break-words"><span className="font-semibold text-slate-700">Manager:</span> {review.employer?.name || '-'}</div>
                           </div>
                         </div>
-                      </button>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => openReportForReview(review)}
+                          className="mt-2 inline-flex items-center gap-1.5 rounded-xl border border-cyan-200 bg-cyan-50 px-2.5 py-1.5 text-[11px] font-semibold text-cyan-700 transition hover:bg-cyan-100"
+                        >
+                          <i className="ri-file-text-line"></i>
+                          Report
+                        </button>
+                      </div>
                     </td>
                     {checklistCells.map((cell) => (
                       <td
@@ -3672,7 +3752,7 @@ export default function ProgressReviewPage() {
               <div className="border-b border-slate-200 bg-white px-6 py-4 flex items-start justify-between">
                 <div>
                   <h3 className="text-lg font-bold tracking-tight text-slate-900">{QA_REPORT_TITLE}</h3>
-                  <p className="mt-1 text-xs font-medium uppercase tracking-[0.18em] text-slate-500">Inspection-ready report view</p>
+                  <p className="mt-1 text-xs font-medium uppercase tracking-[0.18em] text-slate-500">Progress review report view</p>
                 </div>
                 <button
                   onClick={() => setShowSessionReportModal(false)}
@@ -3682,55 +3762,90 @@ export default function ProgressReviewPage() {
                 </button>
               </div>
 
-              <div className="border-b border-slate-200 bg-slate-50 px-6 py-4 flex items-center justify-between gap-4">
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-3 flex-1">
-                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Sessions</p>
-                    <p className="mt-1 text-2xl font-semibold text-slate-900">{reportMetaComputed.totalSessions}</p>
+              <div className="border-b border-slate-200 bg-slate-50 px-6 py-5">
+                <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 xl:min-w-[360px]">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3.5 shadow-sm">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Sessions</p>
+                      <p className="mt-1 text-2xl font-semibold text-slate-900">{reportMetaComputed.totalSessions}</p>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3.5 shadow-sm">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Coaches</p>
+                      <p className="mt-1 text-2xl font-semibold text-slate-900">{reportMetaComputed.uniqueCoaches}</p>
+                    </div>
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3.5 shadow-sm">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Compliance</p>
+                      <p className="mt-1 text-2xl font-semibold text-sky-800">{reportMetaComputed.compliance}%</p>
+                    </div>
                   </div>
-                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Coaches</p>
-                    <p className="mt-1 text-2xl font-semibold text-slate-900">{reportMetaComputed.uniqueCoaches}</p>
-                  </div>
-                  <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Compliance</p>
-                    <p className="mt-1 text-2xl font-semibold text-sky-800">{reportMetaComputed.compliance}%</p>
-                  </div>
-                </div>
-                <div className="w-[28rem] grid grid-cols-2 gap-2">
-                  <div>
-                    <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Coach</p>
-                    <select
-                      value={reportCoachFilter}
-                      onChange={(e) => {
-                        setReportCoachFilter(e.target.value);
-                        setActiveReportId(null);
-                      }}
-                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm"
-                    >
-                      <option value="">Select coach</option>
-                      {reportCoachOptions.map((coachName) => (
-                        <option key={coachName} value={coachName}>
-                          {coachName}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Learner</p>
-                    <select
-                      value={activeReportId || ''}
-                      onChange={(e) => setActiveReportId(e.target.value)}
-                      disabled={!reportCoachFilter || !reportLearnerOptions.length}
-                      className="w-full max-w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 shadow-sm"
-                    >
-                      <option value="">Select learner</option>
-                      {reportLearnerOptions.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name}
-                        </option>
-                      ))}
-                    </select>
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:min-w-[640px] xl:grid-cols-4">
+                    <div className="min-w-0">
+                      <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Date</p>
+                      <select
+                        value={reportDatePreset}
+                        onChange={(e) => {
+                          setReportDatePreset(e.target.value as ReportDatePreset);
+                          if (e.target.value !== 'DAY') {
+                            setReportDateFilter('');
+                          }
+                          setReportCoachFilter('');
+                          setActiveReportId(null);
+                        }}
+                        className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
+                      >
+                        <option value="LAST_MONTH">Last Month</option>
+                        <option value="LAST_3_MONTHS">Last 3 Months</option>
+                        <option value="DAY">By Day</option>
+                      </select>
+                    </div>
+                    <div className="min-w-0">
+                      <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Day</p>
+                      <input
+                        type="date"
+                        value={reportDateFilter}
+                        disabled={reportDatePreset !== 'DAY'}
+                        onChange={(e) => {
+                          setReportDateFilter(e.target.value);
+                          setReportCoachFilter('');
+                          setActiveReportId(null);
+                        }}
+                        className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                      />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Coach</p>
+                      <select
+                        value={reportCoachFilter}
+                        onChange={(e) => {
+                          setReportCoachFilter(e.target.value);
+                          setActiveReportId(null);
+                        }}
+                        className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
+                      >
+                        <option value="">Select coach</option>
+                        {reportCoachOptions.map((coachName) => (
+                          <option key={coachName} value={coachName}>
+                            {coachName}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="min-w-0">
+                      <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Learner</p>
+                      <select
+                        value={activeReportId || ''}
+                        onChange={(e) => setActiveReportId(e.target.value)}
+                        disabled={!reportCoachFilter || !reportLearnerOptions.length}
+                        className="w-full max-w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+                      >
+                        <option value="">Select learner</option>
+                        {reportLearnerOptions.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {item.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -3738,16 +3853,16 @@ export default function ProgressReviewPage() {
               <div className="max-h-[65vh] overflow-y-auto bg-slate-100 px-6 py-6">
                 {activeReportReview ? (
                   <div className="space-y-6 rounded-2xl border border-slate-300 bg-white p-5 shadow-sm">
-                    <div className="grid grid-cols-[165px,1fr] overflow-hidden rounded-xl border border-slate-300">
-                      <div className="flex h-24 items-center justify-center border-r border-slate-300 bg-white px-2">
+                    <div className="grid grid-cols-[250px,1fr] overflow-hidden rounded-xl border border-slate-300">
+                      <div className="flex h-[138px] items-center justify-center border-r border-slate-300 bg-white px-2">
                         <img
                           src={reportLogoSrc}
                           alt="Kent Business College logo"
-                          className="max-h-[82px] w-full max-w-[190px] object-contain object-center"
+                          className="max-h-[134px] w-full max-w-[258px] object-contain object-center"
                         />
                       </div>
                       <div className="px-6 py-5">
-                        <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">Quality Assurance Report</p>
+                        <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500">Progress Review Report</p>
                         <h4 className="text-3xl font-bold leading-tight tracking-tight text-slate-900">{QA_REPORT_TITLE}</h4>
                       </div>
                     </div>
@@ -3889,7 +4004,13 @@ export default function ProgressReviewPage() {
                     </section>
                   </div>
                 ) : (
-                  <div className="rounded-xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center text-sm text-slate-500">Select coach and learner to preview the report.</div>
+                  <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-14 text-center shadow-sm">
+                    <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-slate-100 text-slate-500">
+                      <i className="ri-file-search-line text-xl"></i>
+                    </div>
+                    <p className="mt-4 text-base font-semibold text-slate-700">Choose a coach and learner to preview the report</p>
+                    <p className="mt-1 text-sm text-slate-500">Use the date filter first if you want a specific month, three-month window, or day.</p>
+                  </div>
                 )}
               </div>
 
