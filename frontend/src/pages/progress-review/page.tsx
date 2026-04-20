@@ -1,7 +1,8 @@
 
-import { useEffect, useState, useMemo } from 'react';
+import { useEffect, useState, useMemo, useRef } from 'react';
 import { format } from 'date-fns';
 import { Link, useLocation } from 'react-router-dom';
+import { createPortal } from 'react-dom';
 import {
   BarChart,
   Bar,
@@ -25,6 +26,10 @@ type ProgressReviewsOverviewResponse = {
   reviews: ReviewRecord[];
 };
 
+type ApiRequestOptions = {
+  signal: AbortSignal;
+};
+
 type SessionReportResponse = {
   reportText?: string;
   sourceCount?: number;
@@ -34,6 +39,25 @@ type SessionReportResponse = {
     uniqueCoaches?: number;
     checklistWeightedCompliancePercent?: number;
   };
+};
+
+type CoachTranscriptStatRow = {
+  coachName: string;
+  averageDurationMinutes: number;
+  sessionCount: number;
+  transcriptMissingCount: number;
+  missingSessions: Array<{
+    bookingId: string;
+    meetingDate: string;
+    learnerName: string;
+    durationMinutes: number | null;
+  }>;
+};
+
+type CoachTranscriptStatsResponse = {
+  table?: string;
+  summaryTable?: string | null;
+  rows?: CoachTranscriptStatRow[];
 };
 
 type RAGTooltipSession = {
@@ -96,6 +120,8 @@ const OTJ_COLORS = {
   needAttention: '#F46F88',
 } as const;
 
+const PAGE_FONT_STACK = '"Plus Jakarta Sans", "Manrope", "Segoe UI", sans-serif';
+
 const KPI_STYLES = {
   violet: {
     iconWrap: 'bg-slate-100',
@@ -124,6 +150,140 @@ const KPI_STYLES = {
   },
 } as const;
 
+function buildApiBaseCandidates(apiBase: string): string[] {
+  const normalized = apiBase.replace(/\/$/, '');
+  const candidates: string[] = [];
+
+  if (typeof window !== 'undefined') {
+    const protocol = window.location.protocol || 'http:';
+    const hostname = window.location.hostname || '127.0.0.1';
+    const currentPort = window.location.port || '';
+    const localHosts = hostname === 'localhost' ? ['127.0.0.1', 'localhost'] : [hostname, '127.0.0.1', 'localhost'];
+    const backendCandidates = localHosts.map((host) => `${protocol}//${host}:8000/api/v1`);
+
+    if (normalized.startsWith('/')) {
+      candidates.push(normalized, ...backendCandidates);
+    } else {
+      let parsedBase: URL | null = null;
+      try {
+        parsedBase = new URL(normalized);
+      } catch {
+        parsedBase = null;
+      }
+
+      const pointsToFrontendPort =
+        !!parsedBase &&
+        parsedBase.hostname === hostname &&
+        (parsedBase.port === currentPort || parsedBase.port === '3000' || parsedBase.port === '5173');
+
+      if (pointsToFrontendPort) {
+        candidates.push(...backendCandidates, normalized);
+      } else {
+        candidates.push(normalized, ...backendCandidates);
+      }
+    }
+  } else {
+    candidates.push(normalized);
+  }
+
+  return Array.from(new Set(candidates));
+}
+
+async function fetchProgressReviewsOverview(
+  apiBaseCandidates: string[],
+  options: ApiRequestOptions
+): Promise<ProgressReviewsOverviewResponse> {
+  const errors: string[] = [];
+  const perCandidateTimeoutMs = 4000;
+
+  for (const base of apiBaseCandidates) {
+    if (options.signal.aborted) {
+      throw new DOMException('The request was aborted.', 'AbortError');
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), perCandidateTimeoutMs);
+    const abortHandler = () => controller.abort();
+    options.signal.addEventListener('abort', abortHandler, { once: true });
+
+    try {
+      const response = await fetch(`${base}/progress-reviews/overview?limit=all`, { signal: controller.signal });
+      if (!response.ok) {
+        const message = (await response.text()).trim() || `Request failed with status ${response.status}`;
+        errors.push(`${base}: ${message}`);
+        continue;
+      }
+
+      return (await response.json()) as ProgressReviewsOverviewResponse;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        if (options.signal.aborted) {
+          throw error;
+        }
+        errors.push(`${base}: timed out after ${Math.round(perCandidateTimeoutMs / 1000)} seconds`);
+        continue;
+      }
+
+      const message = error instanceof Error ? error.message : 'Request failed';
+      errors.push(`${base}: ${message}`);
+    } finally {
+      window.clearTimeout(timeoutId);
+      options.signal.removeEventListener('abort', abortHandler);
+    }
+  }
+
+  throw new Error(errors[0] || 'Failed to load reviews');
+}
+
+async function fetchCoachTranscriptStats(
+  apiBaseCandidates: string[],
+  queryString: string,
+  options: ApiRequestOptions
+): Promise<CoachTranscriptStatsResponse> {
+  const errors: string[] = [];
+  const perCandidateTimeoutMs = 4000;
+
+  for (const base of apiBaseCandidates) {
+    if (options.signal.aborted) {
+      throw new DOMException('The request was aborted.', 'AbortError');
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), perCandidateTimeoutMs);
+    const abortHandler = () => controller.abort();
+    options.signal.addEventListener('abort', abortHandler, { once: true });
+
+    try {
+      const response = await fetch(`${base}/progress-reviews/coach-transcript-stats${queryString}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const message = (await response.text()).trim() || `Request failed with status ${response.status}`;
+        errors.push(`${base}: ${message}`);
+        continue;
+      }
+
+      return (await response.json()) as CoachTranscriptStatsResponse;
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        if (options.signal.aborted) {
+          throw error;
+        }
+        errors.push(`${base}: timed out after ${Math.round(perCandidateTimeoutMs / 1000)} seconds`);
+        continue;
+      }
+
+      const message = error instanceof Error ? error.message : 'Request failed';
+      errors.push(`${base}: ${message}`);
+    } finally {
+      window.clearTimeout(timeoutId);
+      options.signal.removeEventListener('abort', abortHandler);
+    }
+  }
+
+  throw new Error(errors[0] || 'Failed to load coach transcript stats');
+}
+
 type KPIColor = keyof typeof KPI_STYLES;
 type DashboardDatePreset = 'ALL' | 'LAST_MONTH' | 'LAST_3_MONTHS' | 'CUSTOM';
 type ReportDatePreset = 'LAST_MONTH' | 'LAST_3_MONTHS' | 'DAY';
@@ -136,6 +296,240 @@ type ChecklistCellEvidenceItem = {
   coachName: string;
   managerName: string;
 };
+
+type SelectOption = {
+  label: string;
+  value: string;
+};
+
+function ModernSelect({
+  value,
+  onChange,
+  options,
+  placeholder,
+  leftIconClassName,
+  disabled = false,
+  buttonClassName = '',
+  menuClassName = '',
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: SelectOption[];
+  placeholder?: string;
+  leftIconClassName?: string;
+  disabled?: boolean;
+  buttonClassName?: string;
+  menuClassName?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const [menuStyle, setMenuStyle] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
+  const selectedOption = options.find((option) => option.value === value) || null;
+
+  useEffect(() => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (
+        !rootRef.current ||
+        (target && rootRef.current.contains(target)) ||
+        (target && menuRef.current?.contains(target))
+      ) {
+        return;
+      }
+      setOpen(false);
+    };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    const handleCloseOthers = () => setOpen(false);
+
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleEscape);
+    window.addEventListener('modern-select:close-all', handleCloseOthers);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleEscape);
+      window.removeEventListener('modern-select:close-all', handleCloseOthers);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open || !buttonRef.current || typeof window === 'undefined') {
+      return;
+    }
+
+    const updateMenuPosition = () => {
+      if (!buttonRef.current) return;
+      const rect = buttonRef.current.getBoundingClientRect();
+      const viewportHeight = window.innerHeight;
+      const spaceBelow = viewportHeight - rect.bottom - 12;
+      const spaceAbove = rect.top - 12;
+      const openUpward = spaceBelow < 280 && spaceAbove > spaceBelow;
+      const maxHeight = Math.max(160, Math.min(320, openUpward ? spaceAbove : spaceBelow));
+
+      setMenuStyle({
+        left: rect.left,
+        width: rect.width,
+        top: openUpward ? Math.max(12, rect.top - maxHeight - 8) : rect.bottom + 8,
+        maxHeight,
+      });
+    };
+
+    updateMenuPosition();
+    window.addEventListener('resize', updateMenuPosition);
+    window.addEventListener('scroll', updateMenuPosition, true);
+
+    return () => {
+      window.removeEventListener('resize', updateMenuPosition);
+      window.removeEventListener('scroll', updateMenuPosition, true);
+    };
+  }, [open]);
+
+  return (
+    <div ref={rootRef} className="relative">
+      <button
+        ref={buttonRef}
+        type="button"
+        disabled={disabled}
+        onClick={() => {
+          if (!open) {
+            window.dispatchEvent(new CustomEvent('modern-select:close-all'));
+          }
+          setOpen((current) => !current);
+        }}
+        className={`group relative w-full rounded-xl border border-slate-200 bg-white py-3 text-left text-sm font-medium text-slate-700 shadow-sm transition duration-200 hover:border-slate-300 hover:bg-slate-50 focus:outline-none focus-visible:border-cyan-300 focus-visible:ring-4 focus-visible:ring-cyan-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400 ${leftIconClassName ? 'pl-10 pr-10' : 'px-4 pr-10'} ${buttonClassName}`}
+      >
+        {leftIconClassName ? (
+          <i className={`${leftIconClassName} pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-sm text-slate-400 transition group-hover:text-slate-500`}></i>
+        ) : null}
+        <span className="block truncate">{selectedOption?.label || placeholder || 'Select option'}</span>
+        <i className={`ri-arrow-down-s-line pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-base text-slate-400 transition duration-200 ${open ? 'rotate-180 text-slate-600' : ''}`}></i>
+      </button>
+
+      {open && !disabled && menuStyle && typeof document !== 'undefined'
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className={`fixed z-[220] overflow-hidden rounded-2xl border border-slate-200/90 bg-white/98 shadow-[0_22px_48px_rgba(15,23,42,0.16)] backdrop-blur-xl ${menuClassName}`}
+              style={{
+                top: menuStyle.top,
+                left: menuStyle.left,
+                width: menuStyle.width,
+              }}
+            >
+              <div className="overflow-y-auto p-1.5" style={{ maxHeight: menuStyle.maxHeight }}>
+                {options.map((option) => {
+                  const selected = option.value === value;
+                  return (
+                    <button
+                      key={`${option.value}-${option.label}`}
+                      type="button"
+                      onClick={() => {
+                        onChange(option.value);
+                        setOpen(false);
+                      }}
+                      className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition duration-150 ${
+                        selected
+                          ? 'bg-[linear-gradient(135deg,#0f8ea0_0%,#0f766e_100%)] text-white shadow-sm'
+                          : 'text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="truncate">{option.label}</span>
+                      {selected ? <i className="ri-check-line ml-3 shrink-0 text-base"></i> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>,
+            document.body
+          )
+        : null}
+    </div>
+  );
+}
+
+function CoachTranscriptPopup({ item, onClose }: { item: CoachTranscriptStatRow; onClose: () => void }) {
+  const sessions = Array.isArray(item.missingSessions) ? item.missingSessions : [];
+
+  return (
+    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-slate-950/40 px-4 py-6 backdrop-blur-sm" onClick={onClose}>
+      <div
+        className="w-full max-w-[560px] overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-[0_30px_80px_rgba(15,23,42,0.22)]"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-5 py-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <div className="flex items-center gap-2.5">
+                <span className="inline-flex items-center rounded-full bg-rose-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] text-rose-700">
+                  Not Evidenced
+                </span>
+              </div>
+              <h4 className="mt-2 text-xl font-bold tracking-tight text-slate-900">{item.coachName}</h4>
+              <p className="mt-1 text-sm text-slate-500">
+                {item.sessionCount} sessions in the current filter.
+                {item.transcriptMissingCount === 0
+                  ? ' No fully not-evidenced sessions for this coach.'
+                  : ` ${item.transcriptMissingCount} sessions were fully marked as not evidenced.`}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex h-10 w-10 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition hover:border-slate-300 hover:text-slate-700"
+            >
+              <i className="ri-close-line text-lg"></i>
+            </button>
+          </div>
+        </div>
+
+        <div className="max-h-[420px] overflow-y-auto px-4 py-4">
+          {sessions.length ? (
+            <div className="space-y-3">
+              {sessions.map((session, index) => (
+                <div
+                  key={`${session.bookingId || session.learnerName}-${session.meetingDate}-${index}`}
+                  className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)] px-4 py-3 shadow-sm"
+                >
+                  <div className="grid gap-3 sm:grid-cols-[minmax(0,1.2fr)_minmax(0,0.9fr)_auto] sm:items-center">
+                    <div className="min-w-0">
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Student</div>
+                      <div className="mt-1 text-base font-semibold text-slate-900">{session.learnerName || 'Unknown Learner'}</div>
+                    </div>
+                    <div>
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Date</div>
+                      <div className="mt-1 inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
+                        <i className="ri-calendar-line text-slate-400"></i>
+                        {session.meetingDate ? format(new Date(session.meetingDate), 'dd MMM yyyy') : '-'}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                      <div className="inline-flex items-center gap-2 rounded-full bg-sky-50 px-3 py-1 text-xs font-medium text-sky-700">
+                        <i className="ri-time-line"></i>
+                        {typeof session.durationMinutes === 'number' ? `${session.durationMinutes.toFixed(1)} min` : 'No duration'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-5 text-sm text-emerald-700">
+              No fully not-evidenced sessions in the current filter.
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function RAGSessionsPopup({ item, onClose }: { item: RAGTooltipItem; onClose: () => void }) {
   return (
@@ -236,20 +630,17 @@ function ChecklistEvidencePopup({ item, onClose }: { item: CompliancePopupItem; 
               <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Filter by coach</div>
               <div className="mt-1 text-sm text-slate-500">Narrow checklist evidence to one coach</div>
             </div>
-            <div className="relative min-w-[220px]">
-              <select
+            <div className="min-w-[220px]">
+              <ModernSelect
                 value={coachFilter}
-                onChange={(event) => setCoachFilter(event.target.value)}
-                className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition focus:border-sky-300 focus:outline-none focus:ring-4 focus:ring-sky-100"
-              >
-                <option value="ALL">All Coaches</option>
-                {coachOptions.filter((option) => option !== 'ALL').map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-              <i className="ri-arrow-down-s-line pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                onChange={setCoachFilter}
+                options={[
+                  { label: 'All Coaches', value: 'ALL' },
+                  ...coachOptions.filter((option) => option !== 'ALL').map((option) => ({ label: option, value: option })),
+                ]}
+                leftIconClassName="ri-user-star-line"
+                buttonClassName="py-2.5"
+              />
             </div>
           </div>
         </div>
@@ -398,20 +789,17 @@ function ManagerAttendancePopup({ item, onClose }: { item: ManagerAttendancePopu
               <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Filter by coach</div>
               <div className="mt-1 text-sm text-slate-500">Narrow attendance details to one coach</div>
             </div>
-            <div className="relative min-w-[220px]">
-              <select
+            <div className="min-w-[220px]">
+              <ModernSelect
                 value={coachFilter}
-                onChange={(event) => setCoachFilter(event.target.value)}
-                className="w-full appearance-none rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 shadow-sm transition focus:border-sky-300 focus:outline-none focus:ring-4 focus:ring-sky-100"
-              >
-                <option value="ALL">All Coaches</option>
-                {coachOptions.filter((option) => option !== 'ALL').map((option) => (
-                  <option key={option} value={option}>
-                    {option}
-                  </option>
-                ))}
-              </select>
-              <i className="ri-arrow-down-s-line pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-slate-400"></i>
+                onChange={setCoachFilter}
+                options={[
+                  { label: 'All Coaches', value: 'ALL' },
+                  ...coachOptions.filter((option) => option !== 'ALL').map((option) => ({ label: option, value: option })),
+                ]}
+                leftIconClassName="ri-user-star-line"
+                buttonClassName="py-2.5"
+              />
             </div>
           </div>
         </div>
@@ -725,6 +1113,7 @@ export default function ProgressReviewPage() {
   const apiBase = apiBaseRaw.endsWith('/api/v1')
     ? apiBaseRaw
     : `${apiBaseRaw.replace(/\/$/, '')}/api/v1`;
+  const apiBaseCandidates = useMemo(() => buildApiBaseCandidates(apiBase), [apiBase]);
   const reviewRequestTimeoutMs = 15000;
 
   const [reviews, setReviews] = useState<ReviewRecord[]>([]);
@@ -735,6 +1124,9 @@ export default function ProgressReviewPage() {
   const [showDetailDrawer, setShowDetailDrawer] = useState(false);
   const [sessionReportLoading, setSessionReportLoading] = useState(false);
   const [sessionReportError, setSessionReportError] = useState<string | null>(null);
+  const [coachTranscriptStats, setCoachTranscriptStats] = useState<CoachTranscriptStatRow[]>([]);
+  const [coachTranscriptStatsLoading, setCoachTranscriptStatsLoading] = useState(false);
+  const [coachTranscriptStatsError, setCoachTranscriptStatsError] = useState<string | null>(null);
   const [sessionReportText, setSessionReportText] = useState('');
   const [sessionReportMeta, setSessionReportMeta] = useState<{
     totalSessions: number;
@@ -754,6 +1146,7 @@ export default function ProgressReviewPage() {
   const [activeRagPopup, setActiveRagPopup] = useState<RAGTooltipItem | null>(null);
   const [activeChecklistPopup, setActiveChecklistPopup] = useState<CompliancePopupItem | null>(null);
   const [activeManagerAttendancePopup, setActiveManagerAttendancePopup] = useState<ManagerAttendancePopupItem | null>(null);
+  const [activeCoachTranscriptPopupCoach, setActiveCoachTranscriptPopupCoach] = useState<string | null>(null);
   const [activeChecklistCellEvidence, setActiveChecklistCellEvidence] = useState<ChecklistCellEvidenceItem | null>(null);
   const [openEvidenceKey, setOpenEvidenceKey] = useState<string | null>(null);
   const [tableFilters, setTableFilters] = useState({
@@ -966,14 +1359,7 @@ export default function ProgressReviewPage() {
     const timeoutId = window.setTimeout(() => controller.abort(), reviewRequestTimeoutMs);
     setLoading(true);
     setLoadError(null);
-    fetch(`${apiBase}/progress-reviews/overview?limit=all`, { signal: controller.signal })
-      .then(async (res) => {
-        if (!res.ok) {
-          const msg = await res.text();
-          throw new Error(msg || 'Failed to load reviews');
-        }
-        return res.json() as Promise<ProgressReviewsOverviewResponse>;
-      })
+    fetchProgressReviewsOverview(apiBaseCandidates, { signal: controller.signal })
       .then((data) => {
         if (!active) return;
         const normalized = Array.isArray(data.reviews)
@@ -1000,7 +1386,69 @@ export default function ProgressReviewPage() {
       window.clearTimeout(timeoutId);
       controller.abort();
     };
-  }, [apiBase, reviewRequestTimeoutMs]);
+  }, [apiBaseCandidates, reviewRequestTimeoutMs]);
+
+  useEffect(() => {
+    let active = true;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), reviewRequestTimeoutMs);
+    const params = new URLSearchParams();
+
+    if (dashboardCoachFilter) {
+      params.set('coach', dashboardCoachFilter);
+    }
+
+    if (dashboardDatePreset === 'LAST_MONTH' || dashboardDatePreset === 'LAST_3_MONTHS') {
+      const endOfToday = new Date();
+      endOfToday.setHours(23, 59, 59, 999);
+      const rangeStart = new Date(endOfToday);
+      rangeStart.setMonth(rangeStart.getMonth() - (dashboardDatePreset === 'LAST_3_MONTHS' ? 3 : 1));
+      rangeStart.setHours(0, 0, 0, 0);
+      params.set('dateFrom', format(rangeStart, 'yyyy-MM-dd'));
+      params.set('dateTo', format(endOfToday, 'yyyy-MM-dd'));
+    } else if (dashboardDatePreset === 'CUSTOM') {
+      const from = dashboardDateFrom;
+      const to = dashboardDateTo;
+      if (from) params.set('dateFrom', from);
+      if (to) params.set('dateTo', to);
+    }
+
+    const queryString = params.toString() ? `?${params.toString()}` : '';
+    setCoachTranscriptStatsLoading(true);
+    setCoachTranscriptStatsError(null);
+
+    fetchCoachTranscriptStats(apiBaseCandidates, queryString, { signal: controller.signal })
+      .then((data) => {
+        if (!active) return;
+        setCoachTranscriptStats(Array.isArray(data.rows) ? data.rows : []);
+      })
+      .catch((err: Error) => {
+        if (!active) return;
+        const message =
+          err.name === 'AbortError'
+            ? `Request timed out after ${Math.round(reviewRequestTimeoutMs / 1000)} seconds while loading coach transcript stats.`
+            : err.message || 'Failed to load coach transcript stats';
+        setCoachTranscriptStatsError(message);
+      })
+      .finally(() => {
+        if (!active) return;
+        window.clearTimeout(timeoutId);
+        setCoachTranscriptStatsLoading(false);
+      });
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [
+    apiBaseCandidates,
+    reviewRequestTimeoutMs,
+    dashboardCoachFilter,
+    dashboardDatePreset,
+    dashboardDateFrom,
+    dashboardDateTo,
+  ]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1514,6 +1962,24 @@ export default function ProgressReviewPage() {
     if (!coachFilteredReportSessions.length || !activeReportId) return null;
     return coachFilteredReportSessions.find((r) => r.id === activeReportId) || null;
   }, [coachFilteredReportSessions, activeReportId]);
+
+  const visibleCoachTranscriptStats = useMemo(
+    () =>
+      coachTranscriptStats.filter((row) => {
+        const coachName = (row.coachName || '').trim();
+        if (!coachName) return false;
+        return !coachName.toLowerCase().startsWith('not evidenced');
+      }),
+    [coachTranscriptStats]
+  );
+
+  const activeCoachTranscriptPopup = useMemo(
+    () =>
+      activeCoachTranscriptPopupCoach
+        ? visibleCoachTranscriptStats.find((row) => row.coachName === activeCoachTranscriptPopupCoach) || null
+        : null,
+    [activeCoachTranscriptPopupCoach, visibleCoachTranscriptStats]
+  );
 
   const activePrintableRating = useMemo(() => {
     if (!activeReportReview) return { rag: '-', score: '-' };
@@ -2553,38 +3019,47 @@ export default function ProgressReviewPage() {
 
   return (
     <div
-      className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.08),_transparent_28%),linear-gradient(180deg,#f7fbff_0%,#f8fafc_38%,#f8fafc_100%)]"
+      className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(6,182,212,0.12),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(16,185,129,0.08),_transparent_20%),linear-gradient(180deg,#f5fbff_0%,#f8fafc_34%,#f7f9fc_100%)] text-slate-900"
+      style={{ fontFamily: PAGE_FONT_STACK }}
       onClick={() => {
         setDueDatePopup(null);
         setOpenEvidenceKey(null);
       }}
     >
-      <div className="max-w-[1600px] mx-auto px-6 py-6">
+      <div className="mx-auto max-w-[1540px] px-4 py-4 sm:px-6 lg:px-8 lg:py-6">
         {!isChecklistMatrixPage ? (
         <>
         {/* Header */}
-        <div className="relative mb-6 overflow-hidden rounded-[30px] border border-slate-200/80 bg-white/95 px-5 py-5 shadow-[0_12px_32px_rgba(15,23,42,0.08)] backdrop-blur lg:px-7">
-          <div className="pointer-events-none absolute inset-y-0 left-0 w-40 bg-[radial-gradient(circle_at_left,_rgba(14,165,233,0.14),_transparent_70%)]" />
-          <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-          <div className="min-w-0 flex items-center gap-4 sm:gap-5">
-            <div className="relative shrink-0 rounded-[26px] border border-cyan-100 bg-gradient-to-br from-cyan-50 via-white to-sky-50 p-1 shadow-sm">
+        <div className="relative mb-5 overflow-hidden rounded-[34px] border border-white/70 bg-[linear-gradient(135deg,rgba(255,255,255,0.98)_0%,rgba(240,249,255,0.98)_44%,rgba(236,253,245,0.96)_100%)] px-5 py-5 shadow-[0_24px_64px_rgba(15,23,42,0.08)] backdrop-blur lg:px-7 lg:py-6">
+          <div className="pointer-events-none absolute inset-y-0 left-0 w-48 bg-[radial-gradient(circle_at_left,_rgba(14,165,233,0.16),_transparent_72%)]" />
+          <div className="pointer-events-none absolute right-[-4rem] top-[-5rem] h-56 w-56 rounded-full bg-emerald-200/25 blur-3xl" />
+          <div className="relative flex flex-col gap-6 xl:flex-row xl:items-center xl:justify-between">
+          <div className="min-w-0 flex items-start gap-4 sm:gap-5">
+            <div className="relative shrink-0 rounded-[26px] border border-white/80 bg-[linear-gradient(160deg,rgba(255,255,255,0.98)_0%,rgba(224,242,254,0.85)_100%)] p-1.5 shadow-[0_16px_32px_rgba(14,165,233,0.10)] ring-1 ring-cyan-100/60">
               <img
                 src={reportLogoSrc}
                 alt="Kent Business College logo"
-                className="h-28 w-auto object-contain sm:h-[118px]"
+                className="h-20 w-auto object-contain sm:h-[88px]"
               />
             </div>
-            <div className="min-w-0 flex min-h-16 flex-col justify-center">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="inline-flex items-center rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-700">
-                  Live Dashboard
+            <div className="min-w-0 flex min-h-16 flex-1 flex-col justify-center">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="inline-flex items-center rounded-full border border-cyan-200/80 bg-white/80 px-3 py-1 text-[11px] font-bold uppercase tracking-[0.2em] text-cyan-700 shadow-sm">
+                  Quality Dashboard
+                </span>
+                <span className="inline-flex items-center gap-2 rounded-full border border-emerald-200/80 bg-emerald-50/80 px-3 py-1 text-[11px] font-semibold text-emerald-700">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500"></span>
+                  Live data
                 </span>
               </div>
-              <h1 className="mt-2 text-[32px] font-black leading-[0.95] tracking-[-0.04em] text-slate-950 sm:text-[40px]">
+              <h1 className="mt-2 text-[30px] font-black leading-[0.92] tracking-[-0.05em] text-slate-950 sm:text-[42px]">
                 Progress Review Report
               </h1>
-              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-slate-500 sm:text-[15px]">
-                <span className="inline-flex items-center gap-2 font-medium text-slate-600">
+              <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-600 sm:text-[15px]">
+                One operational view for review quality, transcript coverage, attendance confidence, scheduling pressure, and coach-level patterns.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-slate-500 sm:text-[14px]">
+                <span className="inline-flex items-center gap-2 rounded-full bg-white/75 px-3 py-1.5 font-medium text-slate-700 shadow-sm">
                   <i className="ri-calendar-line text-cyan-600"></i>
                   {new Date().toLocaleDateString('en-GB', {
                     day: 'numeric',
@@ -2592,36 +3067,38 @@ export default function ProgressReviewPage() {
                     year: 'numeric',
                   })}
                 </span>
-                <span className="inline-flex items-center gap-2 text-slate-400">
+                <span className="inline-flex items-center gap-2 rounded-full bg-white/70 px-3 py-1.5 text-slate-500 shadow-sm">
                   <i className="ri-database-2-line text-slate-400"></i>
-                  Live progress review analytics
+                  Progress review analytics
                 </span>
               </div>
             </div>
           </div>
-          <button
-            onClick={handleExportSessionReport}
-            disabled={sessionReportLoading}
-            className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-[linear-gradient(135deg,#0891b2_0%,#0f766e_100%)] px-5 py-3.5 text-sm font-semibold text-white shadow-[0_10px_24px_rgba(8,145,178,0.22)] transition hover:translate-y-[-1px] hover:shadow-[0_14px_30px_rgba(8,145,178,0.28)] disabled:cursor-not-allowed disabled:bg-cyan-400 disabled:shadow-none sm:w-auto whitespace-nowrap"
-          >
-            <i className="ri-download-2-line text-sm"></i>
-            {sessionReportLoading ? 'Generating...' : 'Export Session Report'}
-          </button>
+          <div className="flex flex-col gap-3 xl:min-w-[260px] xl:items-end">
+            <button
+              onClick={handleExportSessionReport}
+              disabled={sessionReportLoading}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-[18px] bg-[linear-gradient(135deg,#0284c7_0%,#0f766e_100%)] px-5 py-3.5 text-sm font-bold text-white shadow-[0_14px_30px_rgba(8,145,178,0.24)] transition hover:-translate-y-0.5 hover:shadow-[0_18px_36px_rgba(8,145,178,0.28)] disabled:cursor-not-allowed disabled:bg-cyan-400 disabled:shadow-none xl:w-auto whitespace-nowrap"
+            >
+              <i className="ri-download-2-line text-sm"></i>
+              {sessionReportLoading ? 'Generating...' : 'Export Session Report'}
+            </button>
+          </div>
           </div>
         </div>
 
         {loading && (
-          <div className="mb-4 rounded-lg border border-cyan-100 bg-cyan-50 px-4 py-3 text-sm text-cyan-700">
+          <div className="mb-4 rounded-[18px] border border-cyan-100 bg-cyan-50/90 px-4 py-3 text-sm font-medium text-cyan-700 shadow-sm">
             Loading live data from database...
           </div>
         )}
 
-        <div className="mb-4 flex items-start gap-3 rounded-[22px] border border-amber-200/80 bg-[linear-gradient(135deg,rgba(255,251,235,0.96)_0%,rgba(255,247,237,0.98)_100%)] px-4 py-3.5 text-sm text-amber-900 shadow-[0_10px_24px_rgba(245,158,11,0.08)]">
+        <div className="mb-5 flex items-start gap-3 rounded-[22px] border border-amber-200/80 bg-[linear-gradient(135deg,rgba(255,251,235,0.97)_0%,rgba(255,247,237,0.99)_100%)] px-4 py-3.5 text-sm text-amber-900 shadow-[0_12px_24px_rgba(245,158,11,0.08)]">
           <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700">
             <i className="ri-information-line text-base"></i>
           </span>
           <div>
-            <div className="font-semibold text-amber-950">Reporting note</div>
+            <div className="font-bold text-amber-950">Reporting note</div>
             <div className="mt-1 leading-6 text-amber-800">
               The current dashboard view reflects data from March only.
             </div>
@@ -2641,60 +3118,57 @@ export default function ProgressReviewPage() {
         )}
 
         {/* Dashboard Filters */}
-        <div className="mb-7 overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/95 shadow-[0_10px_28px_rgba(15,23,42,0.06)] backdrop-blur">
-          <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-5 py-4">
-            <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-cyan-50 text-cyan-700">
-              <i className="ri-equalizer-line text-lg"></i>
+        <div className="mb-6 overflow-visible rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.97)_0%,rgba(248,250,252,0.95)_100%)] shadow-[0_18px_38px_rgba(15,23,42,0.06)] backdrop-blur">
+          <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f7fbff_100%)] px-5 py-4">
+            <div className="flex h-11 w-11 items-center justify-center rounded-[18px] border border-cyan-100 bg-cyan-50 text-cyan-700 shadow-sm">
+              <i className="ri-equalizer-line text-base"></i>
             </div>
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Dashboard Filters</div>
+              <div className="text-[11px] font-black uppercase tracking-[0.22em] text-slate-400">Dashboard Filters</div>
               <div className="mt-0.5 text-sm font-medium text-slate-600">Refine the coach and date window for this view</div>
             </div>
             <button
               type="button"
               onClick={clearDashboardFilters}
-              className="ml-auto inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-xs font-semibold text-slate-600 transition hover:border-cyan-200 hover:text-cyan-700"
+              className="ml-auto inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-xs font-black text-slate-600 shadow-sm transition hover:border-cyan-200 hover:text-cyan-700"
             >
               <i className="ri-refresh-line"></i>
               Clear Filters
             </button>
           </div>
           <div className="px-5 py-5">
-            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(280px,1.5fr)_minmax(220px,1fr)_minmax(180px,0.8fr)_minmax(180px,0.8fr)]">
-              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
-                <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Coach</label>
-                <div className="relative">
-                <i className="ri-user-star-line absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-sm pointer-events-none"></i>
-                <select
+            <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(300px,1.45fr)_minmax(240px,1fr)_minmax(180px,0.82fr)_minmax(180px,0.82fr)]">
+              <div className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(248,250,252,0.82)_0%,rgba(255,255,255,0.94)_100%)] p-3.5 shadow-sm">
+                <label className="mb-2 block text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">Coach</label>
+                <ModernSelect
                   value={dashboardCoachFilter}
-                  onChange={(e) => setDashboardCoachFilter(e.target.value)}
-                  className="w-full appearance-none rounded-xl border border-slate-200 bg-white pl-9 pr-10 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
-                >
-                  <option value="">All Coaches</option>
-                  {coaches.map((coach) => (
-                    <option key={coach} value={coach}>{coach}</option>
-                  ))}
-                </select>
-                <i className="ri-arrow-down-s-line absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 text-base pointer-events-none"></i>
-                </div>
+                  onChange={setDashboardCoachFilter}
+                  options={[
+                    { label: 'All Coaches', value: '' },
+                    ...coaches.map((coach) => ({ label: coach, value: coach })),
+                  ]}
+                  leftIconClassName="ri-user-star-line"
+                  buttonClassName="bg-white/90"
+                />
               </div>
 
-              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
-                <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Date Range</label>
-                <select
+              <div className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(248,250,252,0.82)_0%,rgba(255,255,255,0.94)_100%)] p-3.5 shadow-sm">
+                <label className="mb-2 block text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">Date Range</label>
+                <ModernSelect
                   value={dashboardDatePreset}
-                  onChange={(e) => setDashboardDatePreset(e.target.value as DashboardDatePreset)}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
-                >
-                  <option value="ALL">All Time</option>
-                  <option value="LAST_MONTH">Last Month</option>
-                  <option value="LAST_3_MONTHS">Last 3 Months</option>
-                  <option value="CUSTOM">Custom Range</option>
-                </select>
+                  onChange={(value) => setDashboardDatePreset(value as DashboardDatePreset)}
+                  options={[
+                    { label: 'All Time', value: 'ALL' },
+                    { label: 'Last Month', value: 'LAST_MONTH' },
+                    { label: 'Last 3 Months', value: 'LAST_3_MONTHS' },
+                    { label: 'Custom Range', value: 'CUSTOM' },
+                  ]}
+                  buttonClassName="focus:border-cyan-300 focus:ring-4 focus:ring-cyan-100"
+                />
               </div>
 
-              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
-                <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">From</label>
+              <div className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(248,250,252,0.82)_0%,rgba(255,255,255,0.94)_100%)] p-3.5 shadow-sm">
+                <label className="mb-2 block text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">From</label>
                 <input
                   type="date"
                   value={dashboardDateFrom}
@@ -2702,12 +3176,12 @@ export default function ProgressReviewPage() {
                     setDashboardDateFrom(e.target.value);
                     if (dashboardDatePreset !== 'CUSTOM') setDashboardDatePreset('CUSTOM');
                   }}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
+                  className="w-full rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
                 />
               </div>
 
-              <div className="rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
-                <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">To</label>
+              <div className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,rgba(248,250,252,0.82)_0%,rgba(255,255,255,0.94)_100%)] p-3.5 shadow-sm">
+                <label className="mb-2 block text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">To</label>
                 <input
                   type="date"
                   value={dashboardDateTo}
@@ -2715,13 +3189,13 @@ export default function ProgressReviewPage() {
                     setDashboardDateTo(e.target.value);
                     if (dashboardDatePreset !== 'CUSTOM') setDashboardDatePreset('CUSTOM');
                   }}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
+                  className="w-full rounded-[16px] border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
                 />
               </div>
             </div>
 
             <div className="mt-5 flex flex-wrap items-center gap-2">
-              <span className="mr-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Quick Range</span>
+              <span className="mr-1 text-[11px] font-black uppercase tracking-[0.16em] text-slate-400">Quick Range</span>
               <button
                 type="button"
                 onClick={() => {
@@ -2729,7 +3203,7 @@ export default function ProgressReviewPage() {
                   setDashboardDateFrom('');
                   setDashboardDateTo('');
                 }}
-                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                className={`rounded-full px-3.5 py-2 text-[11px] font-bold transition ${
                   dashboardDatePreset === 'LAST_MONTH'
                     ? 'bg-[linear-gradient(135deg,#0891b2_0%,#0f766e_100%)] text-white shadow-[0_8px_18px_rgba(8,145,178,0.22)]'
                     : 'border border-cyan-100 bg-cyan-50 text-cyan-700 hover:bg-cyan-100'
@@ -2744,7 +3218,7 @@ export default function ProgressReviewPage() {
                   setDashboardDateFrom('');
                   setDashboardDateTo('');
                 }}
-                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                className={`rounded-full px-3.5 py-2 text-[11px] font-bold transition ${
                   dashboardDatePreset === 'LAST_3_MONTHS'
                     ? 'bg-[linear-gradient(135deg,#0891b2_0%,#0f766e_100%)] text-white shadow-[0_8px_18px_rgba(8,145,178,0.22)]'
                     : 'border border-cyan-100 bg-cyan-50 text-cyan-700 hover:bg-cyan-100'
@@ -2759,7 +3233,7 @@ export default function ProgressReviewPage() {
                   setDashboardDateFrom('');
                   setDashboardDateTo('');
                 }}
-                className={`rounded-full px-4 py-2 text-xs font-semibold transition ${
+                className={`rounded-full px-3.5 py-2 text-[11px] font-bold transition ${
                   dashboardDatePreset === 'ALL'
                     ? 'bg-slate-900 text-white shadow-[0_8px_18px_rgba(15,23,42,0.16)]'
                     : 'border border-slate-200 bg-slate-100 text-slate-700 hover:bg-slate-200'
@@ -2767,6 +3241,172 @@ export default function ProgressReviewPage() {
               >
                 Reset Dates
               </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="mb-6 grid grid-cols-1 gap-5 xl:grid-cols-[320px_minmax(0,1fr)] xl:items-stretch">
+          <div className="relative overflow-hidden rounded-[30px] border border-emerald-100/70 bg-[linear-gradient(160deg,rgba(255,255,255,0.98)_0%,rgba(240,253,250,0.96)_52%,rgba(236,253,245,0.92)_100%)] shadow-[0_20px_44px_rgba(15,23,42,0.08)] backdrop-blur xl:h-[720px]">
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-[linear-gradient(180deg,rgba(255,255,255,0.75)_0%,transparent_100%)]" />
+            <div className="pointer-events-none absolute right-[-2rem] top-[-1rem] h-36 w-36 rounded-full bg-emerald-200/35 blur-3xl" />
+            <div className="pointer-events-none absolute left-[-1rem] bottom-10 h-32 w-32 rounded-full bg-cyan-200/25 blur-3xl" />
+            <div className="relative flex h-full flex-col px-5 py-5">
+              <div className="flex items-start gap-4">
+                <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[20px] border border-emerald-100 bg-white/80 text-emerald-700 shadow-[0_10px_24px_rgba(16,185,129,0.12)] backdrop-blur">
+                  <i className="ri-table-line text-[22px]"></i>
+                </div>
+                <div>
+                  <div className="text-[11px] font-black uppercase tracking-[0.24em] text-emerald-700/55">Coach Snapshot</div>
+                  <h3 className="mt-2 text-[22px] font-black leading-[1.05] tracking-[-0.04em] text-slate-950">Coach Duration and Transcript Coverage</h3>
+                  <p className="mt-2 max-w-md text-sm leading-6 text-slate-600">
+                    A cleaner view of average lecture duration and how often a full session was marked as not evidenced for each coach.
+                  </p>
+                </div>
+              </div>
+
+              {!coachTranscriptStatsLoading && !coachTranscriptStatsError && visibleCoachTranscriptStats.length ? (
+                <div className="mt-6 grid grid-cols-1 gap-3">
+                  <div className="rounded-[22px] border border-white/80 bg-white/85 px-4 py-3.5 shadow-[0_10px_28px_rgba(15,23,42,0.06)] backdrop-blur">
+                    <div className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400">Coaches</div>
+                    <div className="mt-2 flex items-end gap-2">
+                      <div className="text-[34px] font-black leading-none tracking-[-0.04em] text-slate-950">{visibleCoachTranscriptStats.length}</div>
+                      <div className="pb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">active</div>
+                    </div>
+                  </div>
+                  <div className="rounded-[22px] border border-cyan-100/80 bg-[linear-gradient(135deg,rgba(240,249,255,0.98)_0%,rgba(255,255,255,0.92)_100%)] px-4 py-3.5 shadow-[0_10px_28px_rgba(14,165,233,0.08)]">
+                    <div className="text-[10px] font-black uppercase tracking-[0.2em] text-cyan-700/65">Avg Duration</div>
+                    <div className="mt-2 flex items-end gap-1.5">
+                      <div className="text-[34px] font-black leading-none tracking-[-0.04em] text-slate-950">
+                        {(
+                          visibleCoachTranscriptStats.reduce((sum, row) => sum + (Number.isFinite(row.averageDurationMinutes) ? row.averageDurationMinutes : 0), 0) /
+                          Math.max(visibleCoachTranscriptStats.length, 1)
+                        ).toFixed(1)}
+                      </div>
+                      <span className="pb-1 text-[11px] font-black uppercase tracking-[0.18em] text-cyan-700/55">min</span>
+                    </div>
+                  </div>
+                  <div className="rounded-[22px] border border-rose-100/80 bg-[linear-gradient(135deg,#fff1f2_0%,#fff7f7_100%)] px-4 py-3.5 shadow-[0_10px_28px_rgba(244,63,94,0.08)]">
+                    <div className="text-[10px] font-black uppercase tracking-[0.2em] text-rose-400">Not Evidenced</div>
+                    <div className="mt-2 flex items-end gap-2">
+                      <div className="text-[34px] font-black leading-none tracking-[-0.04em] text-rose-700">
+                        {visibleCoachTranscriptStats.reduce((sum, row) => sum + row.transcriptMissingCount, 0)}
+                      </div>
+                      <div className="pb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-rose-400">sessions</div>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="relative overflow-hidden rounded-[30px] border border-white/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.98)_0%,rgba(246,250,252,0.98)_100%)] shadow-[0_20px_44px_rgba(15,23,42,0.08)] backdrop-blur xl:h-[720px]">
+            <div className="pointer-events-none absolute right-0 top-0 h-40 w-40 rounded-full bg-cyan-100/25 blur-3xl" />
+            <div className="relative flex h-full flex-col">
+            <div className="border-b border-slate-100 bg-[linear-gradient(180deg,rgba(255,255,255,0.92)_0%,rgba(248,250,252,0.86)_100%)] px-5 py-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-black uppercase tracking-[0.22em] text-slate-400">Coach Table</div>
+                  <h4 className="mt-1 text-[20px] font-black tracking-[-0.03em] text-slate-950">Duration and evidence by coach</h4>
+                </div>
+                <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white/90 px-3.5 py-2 text-[12px] font-bold text-slate-600 shadow-sm">
+                  <span className="h-2 w-2 rounded-full bg-cyan-500"></span>
+                  Sorted view for current filters
+                </div>
+              </div>
+            </div>
+            <div className="relative min-h-0 flex-1 px-4 py-4">
+              {coachTranscriptStatsLoading ? (
+                <div className="rounded-[24px] border border-slate-200 bg-white/80 px-4 py-8 text-sm text-slate-500 shadow-sm">
+                  Loading coach table...
+                </div>
+              ) : coachTranscriptStatsError ? (
+                <div className="rounded-[24px] border border-red-100 bg-red-50 px-4 py-4 text-sm text-red-700 shadow-sm">
+                  Failed to load coach table: {coachTranscriptStatsError}
+                </div>
+              ) : visibleCoachTranscriptStats.length ? (
+                <div className="h-full overflow-hidden rounded-[26px] border border-slate-200/90 bg-white shadow-[0_14px_30px_rgba(15,23,42,0.06)]">
+                  <div className="h-full overflow-auto">
+                    <table className="min-w-full">
+                      <thead className="sticky top-0 z-20">
+                        <tr className="border-b border-slate-200 bg-[linear-gradient(180deg,#f8fbff_0%,#eef4f8_100%)]">
+                          <th className="bg-[linear-gradient(180deg,#f8fbff_0%,#eef4f8_100%)] px-5 py-4 text-left text-[10px] font-black uppercase tracking-[0.22em] text-slate-500 shadow-[0_1px_0_rgba(226,232,240,0.9)]">Coach</th>
+                          <th className="bg-[linear-gradient(180deg,#f8fbff_0%,#eef4f8_100%)] px-5 py-4 text-left text-[10px] font-black uppercase tracking-[0.22em] text-slate-500 shadow-[0_1px_0_rgba(226,232,240,0.9)]">Average Duration</th>
+                          <th className="bg-[linear-gradient(180deg,#f8fbff_0%,#eef4f8_100%)] px-5 py-4 text-left text-[10px] font-black uppercase tracking-[0.22em] text-slate-500 shadow-[0_1px_0_rgba(226,232,240,0.9)]">Fully Not Evidenced</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {visibleCoachTranscriptStats.map((row, index) => {
+                          const missingTone =
+                            row.transcriptMissingCount >= 15
+                              ? 'bg-rose-100 text-rose-700 border-rose-200'
+                              : row.transcriptMissingCount >= 5
+                                ? 'bg-amber-100 text-amber-700 border-amber-200'
+                                : 'bg-emerald-100 text-emerald-700 border-emerald-200';
+
+                          return (
+                            <tr
+                              key={row.coachName}
+                              className={`border-b border-slate-100/90 transition last:border-b-0 hover:bg-cyan-50/40 ${
+                                index % 2 === 0 ? 'bg-white' : 'bg-slate-50/[0.55]'
+                              }`}
+                            >
+                              <td className="px-5 py-4">
+                                <div className="flex items-center gap-3">
+                                  <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-[18px] border border-emerald-100 bg-[linear-gradient(135deg,#f0fdf4_0%,#dcfce7_100%)] text-sm font-black text-emerald-700 shadow-sm">
+                                    {(row.coachName || 'U')
+                                      .split(' ')
+                                      .filter(Boolean)
+                                      .slice(0, 2)
+                                      .map((part) => part[0])
+                                      .join('')
+                                      .toUpperCase()}
+                                  </div>
+                                  <div>
+                                    <div className="text-[14px] font-bold text-slate-900">{row.coachName}</div>
+                                    <div className="mt-1 text-[11px] font-medium text-slate-400">{row.sessionCount} sessions in current filter</div>
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="px-5 py-4">
+                                <div className="inline-flex items-center rounded-full border border-sky-100 bg-[linear-gradient(135deg,#f0f9ff_0%,#e0f2fe_100%)] px-3.5 py-2 text-sm font-bold text-sky-800 shadow-sm">
+                                  <i className="ri-time-line mr-2 text-sky-600"></i>
+                                  {Number.isFinite(row.averageDurationMinutes) ? row.averageDurationMinutes.toFixed(1) : '-'} min
+                                </div>
+                              </td>
+                              <td className="px-5 py-4">
+                                <button
+                                  type="button"
+                                  onClick={() => setActiveCoachTranscriptPopupCoach(row.coachName)}
+                                  className="group flex w-full items-center gap-3 rounded-2xl px-2.5 py-2 text-left transition hover:bg-white/70 focus:outline-none focus:ring-2 focus:ring-cyan-200"
+                                >
+                                  <span className={`inline-flex min-w-[54px] items-center justify-center rounded-full border px-3 py-1.5 text-sm font-black transition group-hover:scale-[1.03] ${missingTone}`}>
+                                    {row.transcriptMissingCount}
+                                  </span>
+                                  <span className="text-[13px] font-medium text-slate-500 transition group-hover:text-slate-700">
+                                    {row.transcriptMissingCount === 0
+                                      ? 'No fully not-evidenced sessions'
+                                      : row.transcriptMissingCount === 1
+                                        ? '1 fully not-evidenced session'
+                                        : `${row.transcriptMissingCount} fully not-evidenced sessions`}
+                                  </span>
+                                  <span className="ml-auto flex h-8 w-8 items-center justify-center rounded-full bg-slate-100 text-slate-400 transition group-hover:bg-slate-200 group-hover:text-slate-600">
+                                    <i className="ri-arrow-right-up-line text-sm"></i>
+                                  </span>
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-[24px] border border-slate-200 bg-white/80 px-4 py-8 text-sm text-slate-500 shadow-sm">
+                  No coach data matched the current filters.
+                </div>
+              )}
+            </div>
             </div>
           </div>
         </div>
@@ -2780,14 +3420,14 @@ export default function ProgressReviewPage() {
             >
             {/* Charts */}
             <div className="mb-7 grid grid-cols-1 gap-5 xl:grid-cols-[1.02fr_1.58fr]">
-              <div className="h-full overflow-hidden rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f9fbff_100%)] p-5 shadow-sm">
+              <div className="h-full overflow-hidden rounded-[28px] border border-slate-200/90 bg-[linear-gradient(180deg,#ffffff_0%,#f7fbff_100%)] p-5 shadow-[0_14px_34px_rgba(15,23,42,0.05)]">
                 <div className="flex flex-col gap-4 border-b border-slate-100 pb-4 lg:flex-row lg:items-start lg:justify-between">
                   <div>
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">RAG Overview</p>
-                    <h3 className="text-xl font-bold tracking-tight text-slate-900">RAG Status Distribution</h3>
-                    <p className="mt-1 text-sm text-slate-400">Quality ratings breakdown · {ragStatusDistribution.total} total</p>
+                    <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">RAG Overview</p>
+                    <h3 className="text-[22px] font-black tracking-tight text-slate-950">RAG Status Distribution</h3>
+                    <p className="mt-1 text-sm text-slate-500">Quality ratings breakdown · {ragStatusDistribution.total} total</p>
                   </div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-700 shadow-sm">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-bold text-slate-700 shadow-sm">
                     <i className="ri-donut-chart-line text-emerald-600"></i>
                     {ragStatusDistribution.total} sessions
                   </div>
@@ -2818,7 +3458,7 @@ export default function ProgressReviewPage() {
                     </PieChart>
                   </ResponsiveContainer>
                   <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center">
-                    <div className="text-5xl font-bold tracking-tight text-slate-900">{ragStatusDistribution.total}</div>
+                    <div className="text-5xl font-black tracking-tight text-slate-950">{ragStatusDistribution.total}</div>
                     <div className="mt-1 text-base font-medium text-slate-400">Sessions</div>
                   </div>
                 </div>
@@ -2847,14 +3487,14 @@ export default function ProgressReviewPage() {
 
               </div>
 
-              <div className="h-full overflow-hidden rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f9fbff_100%)] p-5 shadow-sm">
+              <div className="h-full overflow-hidden rounded-[28px] border border-slate-200/90 bg-[linear-gradient(180deg,#ffffff_0%,#f7fbff_100%)] p-5 shadow-[0_14px_34px_rgba(15,23,42,0.05)]">
                 <div className="flex flex-col gap-4 border-b border-slate-100 pb-4 lg:flex-row lg:items-start lg:justify-between">
                   <div>
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Checklist Quality</p>
-                    <h3 className="text-xl font-bold tracking-tight text-slate-900">Checklist Evaluation Summary</h3>
-                    <p className="mt-1 text-sm text-slate-400">How many checklist checks were scored as Yes, Partial, and No</p>
+                    <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">Checklist Quality</p>
+                    <h3 className="text-[22px] font-black tracking-tight text-slate-950">Checklist Evaluation Summary</h3>
+                    <p className="mt-1 text-sm text-slate-500">How many checklist checks were scored as Yes, Partial, and No</p>
                   </div>
-                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-700 shadow-sm">
+                  <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-bold text-slate-700 shadow-sm">
                     <i className="ri-list-check-3 text-sky-600"></i>
                     {complianceTotal} checks
                   </div>
@@ -2932,20 +3572,23 @@ export default function ProgressReviewPage() {
             {activeManagerAttendancePopup ? (
               <ManagerAttendancePopup item={activeManagerAttendancePopup} onClose={() => setActiveManagerAttendancePopup(null)} />
             ) : null}
+            {activeCoachTranscriptPopup ? (
+              <CoachTranscriptPopup item={activeCoachTranscriptPopup} onClose={() => setActiveCoachTranscriptPopupCoach(null)} />
+            ) : null}
             {!isChecklistMatrixPage && activeChecklistCellEvidence ? (
               <ChecklistCellEvidencePopup item={activeChecklistCellEvidence} onClose={() => setActiveChecklistCellEvidence(null)} />
             ) : null}
 
-            <div className="mb-7 overflow-hidden rounded-[26px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f9fbff_100%)] p-5 shadow-sm">
+            <div className="mb-7 overflow-hidden rounded-[28px] border border-slate-200/90 bg-[linear-gradient(180deg,#ffffff_0%,#f7fbff_100%)] p-5 shadow-[0_14px_34px_rgba(15,23,42,0.05)]">
               <div className="flex flex-col gap-4 border-b border-slate-100 pb-4 lg:flex-row lg:items-center lg:justify-between">
                 <div>
-                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Manager Attendance</p>
-                  <h3 className="mt-1 text-xl font-bold tracking-tight text-slate-900">Did the manager attend?</h3>
-                  <p className="mt-1 text-sm text-slate-400">
+                  <p className="text-[11px] font-bold uppercase tracking-[0.16em] text-slate-400">Manager Attendance</p>
+                  <h3 className="mt-1 text-[22px] font-black tracking-tight text-slate-950">Did the manager attend?</h3>
+                  <p className="mt-1 text-sm text-slate-500">
                     Based on manager/employer name availability plus the recorded session attendance status.
                   </p>
                 </div>
-                <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-semibold text-slate-700 shadow-sm">
+                <div className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3.5 py-2 text-sm font-bold text-slate-700 shadow-sm">
                   <i className="ri-user-follow-line text-indigo-600"></i>
                   {managerAttendanceSummary.total} sessions reviewed
                 </div>
@@ -3283,7 +3926,7 @@ export default function ProgressReviewPage() {
         {false && isChecklistMatrixPage ? (
         <>
         {/* Filters */}
-        <div className="mb-6 overflow-hidden rounded-[28px] border border-slate-200/80 bg-white/95 shadow-[0_10px_28px_rgba(15,23,42,0.06)] backdrop-blur">
+        <div className="mb-6 overflow-visible rounded-[28px] border border-slate-200/80 bg-white/95 shadow-[0_10px_28px_rgba(15,23,42,0.06)] backdrop-blur">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f9fbff_100%)] px-5 py-4">
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-violet-50 text-violet-700">
@@ -3327,52 +3970,50 @@ export default function ProgressReviewPage() {
               </div>
               <div className="relative rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
                 <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Programme</label>
-                <i className="ri-book-open-line absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
-                <select
+                <ModernSelect
                   value={tableFilters.programme}
-                  onChange={(e) => setTableFilters({ ...tableFilters, programme: e.target.value })}
-                  className="w-full appearance-none rounded-xl border border-slate-200 bg-white pl-9 pr-10 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-violet-300 focus:outline-none focus:ring-4 focus:ring-violet-100"
-                >
-                  <option value="">All Programmes</option>
-                  {programmes.map((programme) => (
-                    <option key={programme} value={programme}>{programme}</option>
-                  ))}
-                </select>
-                <i className="ri-arrow-down-s-line absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
+                  onChange={(value) => setTableFilters({ ...tableFilters, programme: value })}
+                  options={[
+                    { label: 'All Programmes', value: '' },
+                    ...programmes.map((programme) => ({ label: programme, value: programme })),
+                  ]}
+                  leftIconClassName="ri-book-open-line"
+                  buttonClassName="focus:border-violet-300 focus:ring-4 focus:ring-violet-100"
+                />
               </div>
 
               <div className="relative rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
                 <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Status</label>
-                <i className="ri-pulse-line absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
-                <select
+                <ModernSelect
                   value={tableFilters.status}
-                  onChange={(e) => setTableFilters({ ...tableFilters, status: e.target.value as ReviewStatus | '' })}
-                  className="w-full appearance-none rounded-xl border border-slate-200 bg-white pl-9 pr-10 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-violet-300 focus:outline-none focus:ring-4 focus:ring-violet-100"
-                >
-                  <option value="">All Status</option>
-                  <option value="COMPLETED">Completed</option>
-                  <option value="BOOKING">Booked</option>
-                  <option value="AT_RISK">At Risk</option>
-                  <option value="OVERDUE">Overdue</option>
-                </select>
-                <i className="ri-arrow-down-s-line absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
+                  onChange={(value) => setTableFilters({ ...tableFilters, status: value as ReviewStatus | '' })}
+                  options={[
+                    { label: 'All Status', value: '' },
+                    { label: 'Completed', value: 'COMPLETED' },
+                    { label: 'Booked', value: 'BOOKING' },
+                    { label: 'At Risk', value: 'AT_RISK' },
+                    { label: 'Overdue', value: 'OVERDUE' },
+                  ]}
+                  leftIconClassName="ri-pulse-line"
+                  buttonClassName="focus:border-violet-300 focus:ring-4 focus:ring-violet-100"
+                />
               </div>
 
               <div className="relative rounded-2xl border border-slate-200 bg-slate-50/70 p-3.5">
                 <label className="mb-2 block text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-400">Contact Status</label>
-                <i className="ri-phone-line absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
-                <select
+                <ModernSelect
                   value={tableFilters.contactStatus}
-                  onChange={(e) => setTableFilters({ ...tableFilters, contactStatus: e.target.value as ContactOutcome | '' })}
-                  className="w-full appearance-none rounded-xl border border-slate-200 bg-white pl-9 pr-10 py-3 text-sm font-medium text-slate-700 shadow-sm transition focus:border-violet-300 focus:outline-none focus:ring-4 focus:ring-violet-100"
-                >
-                  <option value="">All Contact Status</option>
-                  <option value="NONE">{contactOutcomeLabels.NONE}</option>
-                  <option value="NO_ANSWER">{contactOutcomeLabels.NO_ANSWER}</option>
-                  <option value="CONFIRMED_BOOKING">{contactOutcomeLabels.CONFIRMED_BOOKING}</option>
-                  <option value="CALL_BACK_REQUESTED">{contactOutcomeLabels.CALL_BACK_REQUESTED}</option>
-                </select>
-                <i className="ri-arrow-down-s-line absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm pointer-events-none"></i>
+                  onChange={(value) => setTableFilters({ ...tableFilters, contactStatus: value as ContactOutcome | '' })}
+                  options={[
+                    { label: 'All Contact Status', value: '' },
+                    { label: contactOutcomeLabels.NONE, value: 'NONE' },
+                    { label: contactOutcomeLabels.NO_ANSWER, value: 'NO_ANSWER' },
+                    { label: contactOutcomeLabels.CONFIRMED_BOOKING, value: 'CONFIRMED_BOOKING' },
+                    { label: contactOutcomeLabels.CALL_BACK_REQUESTED, value: 'CALL_BACK_REQUESTED' },
+                  ]}
+                  leftIconClassName="ri-phone-line"
+                  buttonClassName="focus:border-violet-300 focus:ring-4 focus:ring-violet-100"
+                />
               </div>
             </div>
           </div>
@@ -3509,17 +4150,16 @@ export default function ProgressReviewPage() {
                   </label>
                   <div className="relative">
                     <i className="ri-book-open-line pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
-                    <select
+                    <ModernSelect
                       value={tableFilters.programme}
-                      onChange={(e) => setTableFilters({ ...tableFilters, programme: e.target.value })}
-                      className="w-full appearance-none rounded-2xl border border-slate-200 bg-slate-50/70 pl-11 pr-10 py-3.5 text-sm font-medium text-slate-700 shadow-inner transition focus:border-violet-300 focus:bg-white focus:outline-none focus:ring-4 focus:ring-violet-100"
-                    >
-                      <option value="">All Programmes</option>
-                      {programmes.map((programme) => (
-                        <option key={programme} value={programme}>{programme}</option>
-                      ))}
-                    </select>
-                    <i className="ri-arrow-down-s-line pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-base"></i>
+                      onChange={(value) => setTableFilters({ ...tableFilters, programme: value })}
+                      options={[
+                        { label: 'All Programmes', value: '' },
+                        ...programmes.map((programme) => ({ label: programme, value: programme })),
+                      ]}
+                      leftIconClassName="ri-book-open-line"
+                      buttonClassName="rounded-2xl bg-slate-50/70 py-3.5 shadow-inner focus:border-violet-300 focus:bg-white focus:ring-4 focus:ring-violet-100"
+                    />
                   </div>
                 </div>
 
@@ -3532,17 +4172,16 @@ export default function ProgressReviewPage() {
                   </label>
                   <div className="relative">
                     <i className="ri-user-star-line pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 text-sm"></i>
-                    <select
+                    <ModernSelect
                       value={tableFilters.coach}
-                      onChange={(e) => setTableFilters({ ...tableFilters, coach: e.target.value })}
-                      className="w-full appearance-none rounded-2xl border border-slate-200 bg-slate-50/70 pl-11 pr-10 py-3.5 text-sm font-medium text-slate-700 shadow-inner transition focus:border-violet-300 focus:bg-white focus:outline-none focus:ring-4 focus:ring-violet-100"
-                    >
-                      <option value="">All Coaches</option>
-                      {coaches.map((coach) => (
-                        <option key={coach} value={coach}>{coach}</option>
-                      ))}
-                    </select>
-                    <i className="ri-arrow-down-s-line pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-slate-400 text-base"></i>
+                      onChange={(value) => setTableFilters({ ...tableFilters, coach: value })}
+                      options={[
+                        { label: 'All Coaches', value: '' },
+                        ...coaches.map((coach) => ({ label: coach, value: coach })),
+                      ]}
+                      leftIconClassName="ri-user-star-line"
+                      buttonClassName="rounded-2xl bg-slate-50/70 py-3.5 shadow-inner focus:border-violet-300 focus:bg-white focus:ring-4 focus:ring-violet-100"
+                    />
                   </div>
                 </div>
               </div>
@@ -3551,16 +4190,16 @@ export default function ProgressReviewPage() {
         ) : null}
 
         {/* Checklist Table */}
-        <div className="overflow-visible rounded-[30px] border border-slate-200/80 bg-white/95 shadow-[0_12px_32px_rgba(15,23,42,0.06)]">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f9fbff_100%)] px-5 py-4">
+        <div className="overflow-visible rounded-[32px] border border-slate-200/80 bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] shadow-[0_18px_42px_rgba(15,23,42,0.06)]">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-[linear-gradient(180deg,#ffffff_0%,#f8fbff_100%)] px-5 py-4">
             <div>
-              <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">Checklist Matrix</div>
-              <h3 className="mt-1 text-lg font-bold tracking-tight text-slate-900">
+              <div className="text-[11px] font-black uppercase tracking-[0.2em] text-slate-400">Checklist Matrix</div>
+              <h3 className="mt-1 text-[22px] font-black tracking-[-0.03em] text-slate-950">
                 {isChecklistMatrixPage ? filteredReviews.length : displayedReviews.length} sessions in view
               </h3>
             </div>
             {!isChecklistMatrixPage ? (
-              <p className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500">Session profile first, then all 13 QA checks</p>
+              <p className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-500 shadow-sm">Session profile first, then all 13 QA checks</p>
             ) : null}
           </div>
           <div className={`divide-y divide-gray-100 md:hidden ${shouldScrollReviews ? 'max-h-[68rem] overflow-y-auto' : ''}`}>
@@ -3570,24 +4209,36 @@ export default function ProgressReviewPage() {
                 <div key={review.id} className="px-4 py-4 space-y-4">
                   <div className="rounded-[22px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)] px-4 py-3.5 shadow-sm">
                     <div className="flex items-start justify-between gap-3">
-                      <div className="text-[17px] font-bold leading-6 tracking-[-0.02em] text-violet-700">{review.learner.name}</div>
-                      <span className="rounded-full border border-violet-100 bg-violet-50 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-violet-700">
+                      <div className="text-[18px] font-black leading-6 tracking-[-0.025em] text-slate-950">{review.learner.name}</div>
+                      <span className="rounded-full border border-cyan-100 bg-cyan-50 px-2.5 py-1 text-[10px] font-black uppercase tracking-[0.14em] text-cyan-700 shadow-sm">
                         {index + 1}
                       </span>
                     </div>
-                    <div className="mt-1 text-[11px] leading-5 text-slate-500 break-all">{review.learner.email || '-'}</div>
-                    <div className="mt-3 rounded-[18px] border border-slate-200 bg-white px-3.5 py-3 shadow-sm">
-                      <div className="space-y-1.5 text-[12px] leading-5 text-slate-600">
-                        <div className="break-words"><span className="font-semibold text-slate-700">Programme:</span> {review.programme}</div>
-                        <div className="break-words"><span className="font-semibold text-slate-700">Coach:</span> {review.coach.name}</div>
-                        <div><span className="font-semibold text-slate-700">Meeting:</span> {format(new Date(review.meetingDate || review.lastReviewDate), 'dd MMM yyyy')}</div>
-                        <div className="break-words"><span className="font-semibold text-slate-700">Manager:</span> {review.employer?.name || '-'}</div>
+                    <div className="mt-1.5 text-[11px] leading-5 text-slate-500 break-all">{review.learner.email || '-'}</div>
+                    <div className="mt-3 rounded-[20px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)] px-3.5 py-3.5 shadow-[0_8px_20px_rgba(15,23,42,0.05)]">
+                      <div className="space-y-2 text-[12px] leading-5 text-slate-700">
+                        <div className="break-words">
+                          <span className="block text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">Programme</span>
+                          <span className="mt-0.5 block font-semibold text-slate-800">{review.programme}</span>
+                        </div>
+                        <div className="break-words">
+                          <span className="block text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">Coach</span>
+                          <span className="mt-0.5 block font-semibold text-slate-800">{review.coach.name}</span>
+                        </div>
+                        <div>
+                          <span className="block text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">Meeting</span>
+                          <span className="mt-0.5 block font-semibold text-slate-800">{format(new Date(review.meetingDate || review.lastReviewDate), 'dd MMM yyyy')}</span>
+                        </div>
+                        <div className="break-words">
+                          <span className="block text-[10px] font-black uppercase tracking-[0.16em] text-slate-400">Manager</span>
+                          <span className="mt-0.5 block font-semibold text-slate-800">{review.employer?.name || '-'}</span>
+                        </div>
                       </div>
                       <div className="mt-3">
                         <button
                           type="button"
                           onClick={() => openReportForReview(review)}
-                          className="inline-flex items-center gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-3 py-2 text-[12px] font-semibold text-cyan-700 transition hover:bg-cyan-100"
+                          className="inline-flex items-center gap-2 rounded-full border border-cyan-200 bg-[linear-gradient(135deg,#ecfeff_0%,#e0f2fe_100%)] px-3.5 py-2 text-[12px] font-black text-cyan-800 shadow-sm transition hover:shadow-md"
                         >
                           <i className="ri-file-text-line"></i>
                           Open report
@@ -3598,12 +4249,12 @@ export default function ProgressReviewPage() {
 
                   <div className="grid grid-cols-2 gap-2">
                     {checklistCells.map((cell, cellIndex) => (
-                      <div key={`${review.id}-${cell.category}`} className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 shadow-sm">
-                        <div className="text-[11px] font-semibold leading-4 text-slate-600">
+                      <div key={`${review.id}-${cell.category}`} className="rounded-[18px] border border-slate-200 bg-white px-3 py-2.5 shadow-[0_8px_18px_rgba(15,23,42,0.04)]">
+                        <div className="text-[11px] font-bold leading-4 text-slate-700">
                           {cellIndex + 1}. {cell.category}
                         </div>
                         <div className="mt-2">
-                          <span className={`inline-flex h-8 w-8 items-center justify-center rounded-xl border text-[12px] font-bold shadow-sm ${qaEvalClasses(cell.evaluation || 'NO')}`}>
+                          <span className={`inline-flex h-9 w-9 items-center justify-center rounded-2xl border text-[12px] font-black shadow-[0_8px_18px_rgba(15,23,42,0.05)] ${qaEvalClasses(cell.evaluation || 'NO')}`}>
                             <i className={`${qaEvalIcon(cell.evaluation || 'NO')} text-sm`}></i>
                           </span>
                         </div>
@@ -3616,11 +4267,11 @@ export default function ProgressReviewPage() {
           </div>
 
           <div className={`hidden w-full md:block ${shouldScrollReviews ? 'max-h-[72rem] overflow-y-auto' : 'overflow-visible'}`}>
-            <div className="rounded-b-[30px] bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)]">
+            <div className="rounded-b-[32px] bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)]">
             <table className="w-full table-fixed border-separate border-spacing-0">
               <thead className="sticky top-0 z-20">
                 <tr>
-                  <th className="sticky left-0 top-0 z-30 w-[21%] bg-[linear-gradient(180deg,#f5f7fb_0%,#e9eef5_100%)] px-5 py-4 text-left text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500 shadow-[8px_0_18px_rgba(15,23,42,0.05)]">
+                  <th className="sticky left-0 top-0 z-30 w-[21%] border-b border-slate-200 bg-[linear-gradient(180deg,#f7fbff_0%,#eaf1f7_100%)] px-5 py-4 text-left text-[11px] font-black uppercase tracking-[0.18em] text-slate-500 shadow-[10px_0_24px_rgba(15,23,42,0.05)]">
                     <div>Session Info</div>
                     <div className="mt-1.5 max-w-[15rem] text-[11px] font-medium normal-case leading-5 tracking-normal text-slate-400">
                       Learner, coach, date, and manager
@@ -3629,10 +4280,10 @@ export default function ProgressReviewPage() {
                   {QA_REPORT_CRITERIA.map((criterion) => (
                     <th
                       key={criterion.category}
-                      className="w-[6.07%] bg-[linear-gradient(180deg,#fcfdff_0%,#eef2f7_100%)] px-3 py-4 align-top text-left text-[11px] font-semibold tracking-[-0.01em] text-slate-600"
+                      className="w-[6.07%] border-b border-slate-200 bg-[linear-gradient(180deg,#fbfdff_0%,#eef3f8_100%)] px-3 py-4 align-top text-left text-[11px] font-black tracking-[-0.01em] text-slate-600"
                       title={criterion.match.join(' / ')}
                     >
-                      <div className="min-h-[3.1rem] normal-case text-[11px] font-semibold leading-5 text-slate-700 break-words">
+                      <div className="min-h-[3.4rem] normal-case text-[11px] font-bold leading-5 text-slate-700 break-words">
                         {criterion.category}
                       </div>
                     </th>
@@ -3642,10 +4293,10 @@ export default function ProgressReviewPage() {
               <tbody>
                 {displayedReviews.map((review, index) => {
                   const checklistCells = getChecklistMatrixCells(review);
-                  const rowSurface = index % 2 === 0 ? 'bg-white' : 'bg-slate-50/55';
+                  const rowSurface = index % 2 === 0 ? 'bg-white' : 'bg-slate-50/50';
                   return (
                   <tr key={review.id} className={rowSurface}>
-                    <td className={`sticky left-0 z-10 w-[21%] px-4 py-4 align-top shadow-[8px_0_18px_rgba(15,23,42,0.04)] ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
+                    <td className={`sticky left-0 z-10 w-[21%] px-4 py-4 align-top shadow-[10px_0_24px_rgba(15,23,42,0.04)] ${index % 2 === 0 ? 'bg-white' : 'bg-slate-50'}`}>
                       <div className="w-full text-left">
                         <button
                           type="button"
@@ -3653,25 +4304,25 @@ export default function ProgressReviewPage() {
                           className="w-full text-left cursor-pointer"
                         >
                         <div className="flex items-start justify-between gap-3">
-                          <div className="text-[13px] font-semibold text-violet-700 break-words">{review.learner.name}</div>
-                          <span className="rounded-full border border-violet-100 bg-violet-50 px-2 py-0.5 text-[10px] font-bold text-violet-700">
+                          <div className="text-[14px] font-black text-slate-950 break-words">{review.learner.name}</div>
+                          <span className="rounded-full border border-cyan-100 bg-cyan-50 px-2.5 py-1 text-[10px] font-black text-cyan-700 shadow-sm">
                             {index + 1}
                           </span>
                         </div>
                         <div className="mt-0.5 text-[10px] leading-3.5 text-slate-500 break-all">{review.learner.email || '-'}</div>
-                        <div className="mt-2.5 rounded-2xl border border-slate-200 bg-white/95 px-3 py-2.5 shadow-sm">
-                          <div className="space-y-1 text-[10px] leading-3.5 text-slate-600">
-                            <div className="break-words"><span className="font-semibold text-slate-700">Programme:</span> {review.programme}</div>
-                            <div className="break-words"><span className="font-semibold text-slate-700">Coach:</span> {review.coach.name}</div>
-                            <div><span className="font-semibold text-slate-700">Meeting:</span> {format(new Date(review.meetingDate || review.lastReviewDate), 'dd MMM yyyy')}</div>
-                            <div className="break-words"><span className="font-semibold text-slate-700">Manager:</span> {review.employer?.name || '-'}</div>
+                        <div className="mt-3 rounded-[20px] border border-slate-200 bg-[linear-gradient(180deg,#ffffff_0%,#f8fafc_100%)] px-3.5 py-3 shadow-[0_10px_24px_rgba(15,23,42,0.05)]">
+                          <div className="space-y-1.5 text-[10px] leading-4 text-slate-600">
+                            <div className="break-words"><span className="font-black uppercase tracking-[0.12em] text-slate-400">Programme</span><div className="mt-0.5 text-[11px] font-semibold text-slate-700">{review.programme}</div></div>
+                            <div className="break-words"><span className="font-black uppercase tracking-[0.12em] text-slate-400">Coach</span><div className="mt-0.5 text-[11px] font-semibold text-slate-700">{review.coach.name}</div></div>
+                            <div><span className="font-black uppercase tracking-[0.12em] text-slate-400">Meeting</span><div className="mt-0.5 text-[11px] font-semibold text-slate-700">{format(new Date(review.meetingDate || review.lastReviewDate), 'dd MMM yyyy')}</div></div>
+                            <div className="break-words"><span className="font-black uppercase tracking-[0.12em] text-slate-400">Manager</span><div className="mt-0.5 text-[11px] font-semibold text-slate-700">{review.employer?.name || '-'}</div></div>
                           </div>
                         </div>
                         </button>
                         <button
                           type="button"
                           onClick={() => openReportForReview(review)}
-                          className="mt-2 inline-flex items-center gap-1.5 rounded-xl border border-cyan-200 bg-cyan-50 px-2.5 py-1.5 text-[11px] font-semibold text-cyan-700 transition hover:bg-cyan-100"
+                          className="mt-2.5 inline-flex items-center gap-1.5 rounded-full border border-cyan-200 bg-[linear-gradient(135deg,#ecfeff_0%,#e0f2fe_100%)] px-3 py-1.5 text-[11px] font-black text-cyan-800 shadow-sm transition hover:shadow-md"
                         >
                           <i className="ri-file-text-line"></i>
                           Report
@@ -3681,15 +4332,15 @@ export default function ProgressReviewPage() {
                     {checklistCells.map((cell) => (
                       <td
                         key={`${review.id}-${cell.category}`}
-                        className="w-[6.07%] px-1 py-3 align-middle text-center"
+                        className="w-[6.07%] px-1.5 py-4 align-middle text-center"
                         title={cell.comments || cell.category}
                       >
-                        <div className="flex flex-col items-center gap-2">
+                        <div className="flex flex-col items-center gap-2.5">
                           <span
                             aria-label={qaEvalLabel(cell.evaluation || 'NO')}
-                            className={`inline-flex h-8 w-8 items-center justify-center rounded-xl border text-[12px] font-bold shadow-sm ${qaEvalClasses(cell.evaluation || 'NO')}`}
+                            className={`inline-flex h-10 w-10 items-center justify-center rounded-2xl border text-[13px] font-black shadow-[0_8px_18px_rgba(15,23,42,0.06)] ${qaEvalClasses(cell.evaluation || 'NO')}`}
                           >
-                            <i className={`${qaEvalIcon(cell.evaluation || 'NO')} text-sm`}></i>
+                            <i className={`${qaEvalIcon(cell.evaluation || 'NO')} text-base`}></i>
                           </span>
                           <button
                             type="button"
@@ -3707,7 +4358,7 @@ export default function ProgressReviewPage() {
                                 managerName: review.employer?.name || '-',
                               });
                             }}
-                            className="inline-flex h-5 min-w-[1.25rem] items-center justify-center rounded-md bg-sky-100 px-1.5 text-[10px] font-bold text-sky-700 shadow-sm"
+                            className="inline-flex h-5 min-w-[1.35rem] items-center justify-center rounded-full border border-sky-100 bg-sky-50 px-1.5 text-[10px] font-black text-sky-700 shadow-sm"
                             title="View checklist evidence"
                           >
                             E
@@ -3781,22 +4432,23 @@ export default function ProgressReviewPage() {
                   <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:min-w-[640px] xl:grid-cols-4">
                     <div className="min-w-0">
                       <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Date</p>
-                      <select
+                      <ModernSelect
                         value={reportDatePreset}
-                        onChange={(e) => {
-                          setReportDatePreset(e.target.value as ReportDatePreset);
-                          if (e.target.value !== 'DAY') {
+                        onChange={(value) => {
+                          setReportDatePreset(value as ReportDatePreset);
+                          if (value !== 'DAY') {
                             setReportDateFilter('');
                           }
                           setReportCoachFilter('');
                           setActiveReportId(null);
                         }}
-                        className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
-                      >
-                        <option value="LAST_MONTH">Last Month</option>
-                        <option value="LAST_3_MONTHS">Last 3 Months</option>
-                        <option value="DAY">By Day</option>
-                      </select>
+                        options={[
+                          { label: 'Last Month', value: 'LAST_MONTH' },
+                          { label: 'Last 3 Months', value: 'LAST_3_MONTHS' },
+                          { label: 'By Day', value: 'DAY' },
+                        ]}
+                        buttonClassName="border-slate-300 py-2.5 focus:border-cyan-300 focus:ring-4 focus:ring-cyan-100"
+                      />
                     </div>
                     <div className="min-w-0">
                       <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Day</p>
@@ -3814,37 +4466,31 @@ export default function ProgressReviewPage() {
                     </div>
                     <div className="min-w-0">
                       <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Coach</p>
-                      <select
+                      <ModernSelect
                         value={reportCoachFilter}
-                        onChange={(e) => {
-                          setReportCoachFilter(e.target.value);
+                        onChange={(value) => {
+                          setReportCoachFilter(value);
                           setActiveReportId(null);
                         }}
-                        className="w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100"
-                      >
-                        <option value="">Select coach</option>
-                        {reportCoachOptions.map((coachName) => (
-                          <option key={coachName} value={coachName}>
-                            {coachName}
-                          </option>
-                        ))}
-                      </select>
+                        options={[
+                          { label: 'Select coach', value: '' },
+                          ...reportCoachOptions.map((coachName) => ({ label: coachName, value: coachName })),
+                        ]}
+                        buttonClassName="border-slate-300 py-2.5 focus:border-cyan-300 focus:ring-4 focus:ring-cyan-100"
+                      />
                     </div>
                     <div className="min-w-0">
                       <p className="mb-1.5 pl-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500">Learner</p>
-                      <select
+                      <ModernSelect
                         value={activeReportId || ''}
-                        onChange={(e) => setActiveReportId(e.target.value)}
+                        onChange={setActiveReportId}
                         disabled={!reportCoachFilter || !reportLearnerOptions.length}
-                        className="w-full max-w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-slate-800 shadow-sm transition focus:border-cyan-300 focus:outline-none focus:ring-4 focus:ring-cyan-100 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
-                      >
-                        <option value="">Select learner</option>
-                        {reportLearnerOptions.map((item) => (
-                          <option key={item.id} value={item.id}>
-                            {item.name}
-                          </option>
-                        ))}
-                      </select>
+                        options={[
+                          { label: 'Select learner', value: '' },
+                          ...reportLearnerOptions.map((item) => ({ label: item.name, value: item.id })),
+                        ]}
+                        buttonClassName="border-slate-300 py-2.5 focus:border-cyan-300 focus:ring-4 focus:ring-cyan-100"
+                      />
                     </div>
                   </div>
                 </div>

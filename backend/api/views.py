@@ -836,6 +836,218 @@ def _looks_missing_employer(value):
     }
 
 
+def _contains_not_evidenced_text(value):
+    text = str(value or "").strip().lower()
+    return "not evidenced" in text
+
+
+def _contains_transcript_gap_text(value):
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+
+    transcript_gap_markers = (
+        "not evidenced in transcript",
+        "no transcript evidence",
+        "without transcript detail",
+        "without transcript details",
+        "in the transcript provided",
+        "in the transcript",
+        "present in the transcript",
+        "reference in the transcript",
+        "recorded in the transcript",
+        "captured in the transcript",
+        "cannot confirm",
+        "no evidence of discussion",
+        "there is no record",
+    )
+    return any(marker in text for marker in transcript_gap_markers)
+
+
+def _summary_requires_zero_duration(summary_value, summary_text_value=None):
+    if not _summary_has_transcript_evidence(summary_value, summary_text_value):
+        return True
+
+    parsed = summary_value
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if not parsed and isinstance(summary_text_value, str):
+        try:
+            parsed = json.loads(summary_text_value)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        return False
+
+    qa_entries = parsed.get("qa")
+    if not isinstance(qa_entries, list) or not qa_entries:
+        return False
+
+    transcript_gap_hits = 0
+    checked_items = 0
+
+    for item in qa_entries:
+        if not isinstance(item, dict):
+            continue
+        checked_items += 1
+        candidate_texts = [
+            item.get("result"),
+            item.get("notes"),
+            item.get("comment"),
+            item.get("comments"),
+        ]
+        evidence_entries = item.get("evidence")
+        if isinstance(evidence_entries, list):
+            for evidence_item in evidence_entries:
+                if not isinstance(evidence_item, dict):
+                    continue
+                candidate_texts.extend(
+                    [
+                        evidence_item.get("quote"),
+                        evidence_item.get("why_it_matters"),
+                    ]
+                )
+        if any(_contains_transcript_gap_text(value) for value in candidate_texts):
+            transcript_gap_hits += 1
+
+    if checked_items == 0:
+        return False
+
+    return transcript_gap_hits >= min(checked_items, 3)
+
+
+def _summary_has_transcript_evidence(summary_value, summary_text_value=None):
+    parsed = summary_value
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            parsed = None
+
+    raw_text_candidates = []
+    if isinstance(summary_text_value, str):
+        raw_text_candidates.append(summary_text_value.strip())
+        if not parsed:
+            try:
+                parsed = json.loads(summary_text_value)
+            except json.JSONDecodeError:
+                parsed = None
+
+    if isinstance(parsed, dict):
+        candidate_parts = []
+        for key in ("executive_summary", "professional_judgement", "professionalJudgement"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                candidate_parts.append(value.strip())
+
+        for key in ("strengths", "areas_for_development"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                candidate_parts.extend(str(item).strip() for item in value if str(item).strip())
+
+        priority_actions = parsed.get("priority_actions")
+        if isinstance(priority_actions, list):
+            for item in priority_actions:
+                if isinstance(item, str) and item.strip():
+                    candidate_parts.append(item.strip())
+                elif isinstance(item, dict):
+                    action_value = str(item.get("action") or "").strip()
+                    if action_value:
+                        candidate_parts.append(action_value)
+
+        qa_entries = parsed.get("qa")
+        if isinstance(qa_entries, list):
+            for item in qa_entries:
+                if not isinstance(item, dict):
+                    continue
+                for key in ("notes", "comment", "comments", "result"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidate_parts.append(value.strip())
+                evidence_entries = item.get("evidence")
+                if isinstance(evidence_entries, list):
+                    for evidence_item in evidence_entries:
+                        if not isinstance(evidence_item, dict):
+                            continue
+                        for key in ("quote", "why_it_matters"):
+                            value = evidence_item.get(key)
+                            if isinstance(value, str) and value.strip():
+                                candidate_parts.append(value.strip())
+
+        raw_text_candidates.extend(candidate_parts)
+
+    for text in raw_text_candidates:
+        normalized = str(text or "").strip()
+        if not normalized:
+            continue
+        lowered = normalized.lower()
+        if lowered in {"not evidenced", "not evidenced in transcript", "no transcript evidence available."}:
+            continue
+        if normalized.startswith("{") or normalized.startswith("["):
+            continue
+        return True
+
+    return False
+
+
+def _summary_is_fully_not_evidenced(summary_value, summary_text_value=None):
+    if _summary_requires_zero_duration(summary_value, summary_text_value):
+        return True
+
+    parsed = summary_value
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if not parsed and isinstance(summary_text_value, str):
+        try:
+            parsed = json.loads(summary_text_value)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if not isinstance(parsed, dict):
+        return False
+
+    qa_entries = parsed.get("qa")
+    if not isinstance(qa_entries, list) or not qa_entries:
+        return False
+    if len(qa_entries) < len(QA_CRITERIA_TITLES):
+        return False
+
+    for item in qa_entries:
+        if not isinstance(item, dict):
+            return False
+
+        candidate_texts = [
+            item.get("result"),
+            item.get("notes"),
+            item.get("comment"),
+            item.get("comments"),
+        ]
+        evidence_entries = item.get("evidence")
+        if isinstance(evidence_entries, list):
+            for evidence_item in evidence_entries:
+                if isinstance(evidence_item, dict):
+                    candidate_texts.extend(
+                        [
+                            evidence_item.get("quote"),
+                            evidence_item.get("why_it_matters"),
+                        ]
+                    )
+
+        if not any(_contains_not_evidenced_text(value) for value in candidate_texts):
+            return False
+
+    return True
+
+
 def _extract_third_person_name(summary_obj, learner_name, coach_name):
     excluded = {_norm_name(learner_name), _norm_name(coach_name)}
     if "@" in (learner_name or ""):
@@ -1168,6 +1380,17 @@ def _attendance_from_summary(summary_obj):
 
 
 def _checklist_from_summary(summary_obj):
+    if not _summary_has_transcript_evidence(summary_obj):
+        return [
+            {
+                "id": index,
+                "category": title,
+                "evaluation": "NO",
+                "comments": "Not evidenced in transcript",
+            }
+            for index, title in enumerate(QA_CRITERIA_TITLES, start=1)
+        ]
+
     qa_entries = summary_obj.get("qa")
     checklist = []
     if isinstance(qa_entries, list):
@@ -1549,6 +1772,134 @@ def _fetch_latest_booking_sessions(limit):
     return {"ok": True, "status": 200, "payload": {"table": "booking_sessions", "bookings": bookings}}
 
 
+def _fetch_coach_transcript_stats(coach_name=None, date_from=None, date_to=None):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND lower(table_name) = lower(%s)
+            )
+            """,
+            [SUMMARY_TABLE_NAME],
+        )
+        summary_table_exists = bool(cursor.fetchone()[0])
+        if not summary_table_exists:
+            return {
+                "ok": False,
+                "status": 404,
+                "payload": {"error": "Summary table was not found", "expectedTable": SUMMARY_TABLE_NAME},
+            }
+
+        filters = [
+            "(summary_json IS NOT NULL OR (summary_text IS NOT NULL AND BTRIM(summary_text) <> ''))",
+        ]
+        params = []
+
+        base_where = " AND ".join(filters)
+
+        cursor.execute(
+            f'''
+            SELECT
+                id,
+                booking_id,
+                summary_json::text AS summary_json_text,
+                summary_text
+            FROM public."{SUMMARY_TABLE_NAME}"
+            WHERE {base_where}
+            ORDER BY created_at DESC NULLS LAST, id DESC
+            ''',
+            params,
+        )
+        raw_rows = cursor.fetchall()
+
+    aggregated = {}
+    for row_id, booking_id, summary_json_text, summary_text_value in raw_rows:
+        summary_obj = {}
+        if summary_json_text:
+            try:
+                summary_obj = json.loads(summary_json_text)
+            except json.JSONDecodeError:
+                summary_obj = {}
+        if not summary_obj and isinstance(summary_text_value, str):
+            try:
+                summary_obj = json.loads(summary_text_value)
+            except json.JSONDecodeError:
+                summary_obj = {}
+
+        normalized_coach = (summary_obj.get("coach") or "").strip()
+        meeting_date = _safe_date(summary_obj.get("date"))
+        if date_from and meeting_date and meeting_date < date_from:
+            continue
+        if date_to and meeting_date and meeting_date > date_to:
+            continue
+        if date_from and not meeting_date:
+            continue
+        if date_to and not meeting_date:
+            continue
+        if not normalized_coach:
+            continue
+        if coach_name and normalized_coach.lower() != coach_name.lower():
+            continue
+
+        learner_name = (summary_obj.get("learner") or "").strip() or f"Learner {row_id}"
+        duration_minutes = summary_obj.get("duration_inferred_minutes")
+        if not isinstance(duration_minutes, (int, float)):
+            duration_minutes = _parse_duration_minutes(summary_obj.get("duration"))
+
+        coach_state = aggregated.setdefault(
+            normalized_coach,
+            {
+                "durationValues": [],
+                "missingSessions": [],
+                "sessionCount": 0,
+            },
+        )
+
+        is_fully_not_evidenced = _summary_requires_zero_duration(summary_json_text, summary_text_value)
+
+        coach_state["sessionCount"] += 1
+        if not is_fully_not_evidenced and isinstance(duration_minutes, (int, float)):
+            coach_state["durationValues"].append(float(duration_minutes))
+
+        if is_fully_not_evidenced:
+            coach_state["missingSessions"].append(
+                {
+                    "bookingId": booking_id or str(row_id),
+                    "meetingDate": meeting_date.isoformat() if meeting_date else None,
+                    "learnerName": learner_name,
+                    "durationMinutes": 0.0,
+                }
+            )
+
+    stats = []
+    for coach in sorted(aggregated.keys()):
+        coach_state = aggregated[coach]
+        duration_values = coach_state["durationValues"]
+        average_duration = round(sum(duration_values) / len(duration_values), 1) if duration_values else 0.0
+        stats.append(
+            {
+                "coachName": coach,
+                "averageDurationMinutes": average_duration,
+                "sessionCount": coach_state["sessionCount"],
+                "transcriptMissingCount": len(coach_state["missingSessions"]),
+                "missingSessions": coach_state["missingSessions"],
+            }
+        )
+
+    return {
+        "ok": True,
+        "status": 200,
+        "payload": {
+            "table": SUMMARY_TABLE_NAME,
+            "summaryTable": SUMMARY_TABLE_NAME,
+            "rows": stats,
+        },
+    }
+
+
 def _fetch_progress_reviews(limit):
     completed_result = _fetch_completed_progress_reviews(limit)
     if not completed_result["ok"]:
@@ -1887,3 +2238,27 @@ def progress_reviews_session_report(request):
         **aggregated,
     }
     return JsonResponse(payload, status=200)
+
+
+@require_GET
+def progress_reviews_coach_transcript_stats(request):
+    coach_name = (request.GET.get("coach") or "").strip()
+    raw_date_from = (request.GET.get("dateFrom") or "").strip()
+    raw_date_to = (request.GET.get("dateTo") or "").strip()
+
+    date_from = _safe_date(raw_date_from) if raw_date_from else None
+    date_to = _safe_date(raw_date_to) if raw_date_to else None
+
+    if raw_date_from and not date_from:
+        return JsonResponse({"error": "dateFrom must be a valid date"}, status=400)
+    if raw_date_to and not date_to:
+        return JsonResponse({"error": "dateTo must be a valid date"}, status=400)
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+
+    result = _fetch_coach_transcript_stats(
+        coach_name=coach_name or None,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return JsonResponse(result["payload"], status=result["status"])

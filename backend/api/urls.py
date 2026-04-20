@@ -8,6 +8,7 @@ from .views import (
     dashboard_status_counts,
     dashboard_weekly_trend,
     health_check,
+    progress_reviews_coach_transcript_stats,
     progress_reviews_otj_snapshot,
     progress_reviews_overview,
     progress_reviews_session_report,
@@ -23,5 +24,6 @@ urlpatterns = [
     path("dashboard/weekly-trend", dashboard_weekly_trend, name="dashboard_weekly_trend"),
     path("progress-reviews/overview", progress_reviews_overview, name="progress_reviews_overview"),
     path("progress-reviews/otj-snapshot", progress_reviews_otj_snapshot, name="progress_reviews_otj_snapshot"),
+    path("progress-reviews/coach-transcript-stats", progress_reviews_coach_transcript_stats, name="progress_reviews_coach_transcript_stats"),
     path("progress-reviews/session-report", progress_reviews_session_report, name="progress_reviews_session_report"),
 ]
