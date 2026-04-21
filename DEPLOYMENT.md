@@ -2,9 +2,9 @@
 
 This project matches the server layout shown in production:
 
-- Backend root: `/var/www/pr_dashboard/backend`
-- Frontend root: `/var/www/pr_dashboard/frontend`
-- OpenLiteSpeed document root: `/var/www/pr_dashboard/frontend/dist`
+- Backend root: `/var/www/pr_dashborad/backend`
+- Frontend root: `/var/www/pr_dashborad/frontend`
+- OpenLiteSpeed document root: `/var/www/pr_dashborad/frontend/dist`
 - OpenLiteSpeed proxy context: `/api/`
 - Gunicorn upstream: `127.0.0.1:8010`
 - Public domain: `pr.kentbusinesscollege.net`
@@ -23,14 +23,14 @@ git push origin main
 ## 2. Prepare the server
 
 ```bash
-cd /var/www/pr_dashboard
+cd /var/www/pr_dashborad
 git pull origin main
 ```
 
 ### Backend
 
 ```bash
-cd /var/www/pr_dashboard/backend
+cd /var/www/pr_dashborad/backend
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -61,19 +61,19 @@ VITE_USE_MOCK=false
 Then build:
 
 ```bash
-cd /var/www/pr_dashboard/frontend
+cd /var/www/pr_dashborad/frontend
 npm install
 npm run build
 ```
 
-This writes the production files to `/var/www/pr_dashboard/frontend/dist`, which matches the OpenLiteSpeed document root in your screenshots.
+This writes the production files to `/var/www/pr_dashborad/frontend/dist`, which matches the OpenLiteSpeed document root in your screenshots.
 
 ## 3. Run Gunicorn
 
 Temporary manual run:
 
 ```bash
-cd /var/www/pr_dashboard/backend
+cd /var/www/pr_dashborad/backend
 source .venv/bin/activate
 gunicorn -c gunicorn.conf.py
 ```
@@ -81,7 +81,7 @@ gunicorn -c gunicorn.conf.py
 Systemd service setup:
 
 ```bash
-sudo cp /var/www/pr_dashboard/deploy/pr_dashboard-gunicorn.service /etc/systemd/system/
+sudo cp /var/www/pr_dashborad/deploy/pr_dashboard-gunicorn.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable pr_dashboard-gunicorn
 sudo systemctl start pr_dashboard-gunicorn
@@ -92,8 +92,8 @@ sudo systemctl status pr_dashboard-gunicorn
 
 Use the same production setup already shown in your screenshots:
 
-- Virtual host root: `/var/www/pr_dashboard/backend`
-- Document root: `/var/www/pr_dashboard/frontend/dist`
+- Virtual host root: `/var/www/pr_dashborad/backend`
+- Document root: `/var/www/pr_dashborad/frontend/dist`
 - Static context: `/`
 - Proxy context: `/api/`
 - External app address: `127.0.0.1:8010`
@@ -105,7 +105,7 @@ If the proxy context forwards `/api/` to Gunicorn, Django will receive routes li
 Whenever you change the code:
 
 ```bash
-cd /var/www/pr_dashboard
+cd /var/www/pr_dashborad
 git pull origin main
 cd frontend && npm run build
 cd ../backend

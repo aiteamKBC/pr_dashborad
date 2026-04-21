@@ -158,7 +158,8 @@ function buildApiBaseCandidates(apiBase: string): string[] {
     const protocol = window.location.protocol || 'http:';
     const hostname = window.location.hostname || '127.0.0.1';
     const currentPort = window.location.port || '';
-    const localHosts = hostname === 'localhost' ? ['127.0.0.1', 'localhost'] : [hostname, '127.0.0.1', 'localhost'];
+    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+    const localHosts = isLocalHost ? ['127.0.0.1', 'localhost'] : [];
     const backendCandidates = localHosts.map((host) => `${protocol}//${host}:8000/api/v1`);
 
     if (normalized.startsWith('/')) {
@@ -176,7 +177,7 @@ function buildApiBaseCandidates(apiBase: string): string[] {
         parsedBase.hostname === hostname &&
         (parsedBase.port === currentPort || parsedBase.port === '3000' || parsedBase.port === '5173');
 
-      if (pointsToFrontendPort) {
+      if (pointsToFrontendPort && isLocalHost) {
         candidates.push(...backendCandidates, normalized);
       } else {
         candidates.push(normalized, ...backendCandidates);
