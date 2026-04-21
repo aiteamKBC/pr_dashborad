@@ -1,0 +1,15 @@
+[Unit]
+Description=Gunicorn for pr_dashboard Django backend
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/pr_dashboard/backend
+EnvironmentFile=/var/www/pr_dashboard/backend/.env
+ExecStart=/var/www/pr_dashboard/backend/.venv/bin/gunicorn -c /var/www/pr_dashboard/backend/gunicorn.conf.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
