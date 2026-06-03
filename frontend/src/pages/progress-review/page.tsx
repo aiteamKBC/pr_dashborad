@@ -121,6 +121,8 @@ const OTJ_COLORS = {
 } as const;
 
 const PAGE_FONT_STACK = '"Plus Jakarta Sans", "Manrope", "Segoe UI", sans-serif';
+const API_CANDIDATE_TIMEOUT_MS = 20000;
+const API_REQUEST_TIMEOUT_MS = 30000;
 
 const KPI_STYLES = {
   violet: {
@@ -163,7 +165,11 @@ function buildApiBaseCandidates(apiBase: string): string[] {
     const backendCandidates = localHosts.map((host) => `${protocol}//${host}:8000/api/v1`);
 
     if (normalized.startsWith('/')) {
-      candidates.push(normalized, ...backendCandidates);
+      if (isLocalHost) {
+        candidates.push(...backendCandidates, normalized);
+      } else {
+        candidates.push(normalized);
+      }
     } else {
       let parsedBase: URL | null = null;
       try {
@@ -195,7 +201,6 @@ async function fetchProgressReviewsOverview(
   options: ApiRequestOptions
 ): Promise<ProgressReviewsOverviewResponse> {
   const errors: string[] = [];
-  const perCandidateTimeoutMs = 4000;
 
   for (const base of apiBaseCandidates) {
     if (options.signal.aborted) {
@@ -203,7 +208,7 @@ async function fetchProgressReviewsOverview(
     }
 
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), perCandidateTimeoutMs);
+    const timeoutId = window.setTimeout(() => controller.abort(), API_CANDIDATE_TIMEOUT_MS);
     const abortHandler = () => controller.abort();
     options.signal.addEventListener('abort', abortHandler, { once: true });
 
@@ -221,7 +226,7 @@ async function fetchProgressReviewsOverview(
         if (options.signal.aborted) {
           throw error;
         }
-        errors.push(`${base}: timed out after ${Math.round(perCandidateTimeoutMs / 1000)} seconds`);
+        errors.push(`${base}: timed out after ${Math.round(API_CANDIDATE_TIMEOUT_MS / 1000)} seconds`);
         continue;
       }
 
@@ -242,7 +247,6 @@ async function fetchCoachTranscriptStats(
   options: ApiRequestOptions
 ): Promise<CoachTranscriptStatsResponse> {
   const errors: string[] = [];
-  const perCandidateTimeoutMs = 4000;
 
   for (const base of apiBaseCandidates) {
     if (options.signal.aborted) {
@@ -250,7 +254,7 @@ async function fetchCoachTranscriptStats(
     }
 
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), perCandidateTimeoutMs);
+    const timeoutId = window.setTimeout(() => controller.abort(), API_CANDIDATE_TIMEOUT_MS);
     const abortHandler = () => controller.abort();
     options.signal.addEventListener('abort', abortHandler, { once: true });
 
@@ -270,7 +274,7 @@ async function fetchCoachTranscriptStats(
         if (options.signal.aborted) {
           throw error;
         }
-        errors.push(`${base}: timed out after ${Math.round(perCandidateTimeoutMs / 1000)} seconds`);
+        errors.push(`${base}: timed out after ${Math.round(API_CANDIDATE_TIMEOUT_MS / 1000)} seconds`);
         continue;
       }
 
@@ -1115,7 +1119,7 @@ export default function ProgressReviewPage() {
     ? apiBaseRaw
     : `${apiBaseRaw.replace(/\/$/, '')}/api/v1`;
   const apiBaseCandidates = useMemo(() => buildApiBaseCandidates(apiBase), [apiBase]);
-  const reviewRequestTimeoutMs = 15000;
+  const reviewRequestTimeoutMs = API_REQUEST_TIMEOUT_MS;
 
   const [reviews, setReviews] = useState<ReviewRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1550,9 +1554,25 @@ export default function ProgressReviewPage() {
     () => dashboardReviews.filter((review) => matchesFilters(review, tableFilters)),
     [tableFilters, dashboardReviews]
   );
+  const sortedFilteredReviews = useMemo(
+    () =>
+      [...filteredReviews].sort((a, b) => {
+        const dateA = new Date(a.meetingDate || a.lastReviewDate).getTime();
+        const dateB = new Date(b.meetingDate || b.lastReviewDate).getTime();
+        const safeDateA = Number.isNaN(dateA) ? 0 : dateA;
+        const safeDateB = Number.isNaN(dateB) ? 0 : dateB;
+
+        if (safeDateA !== safeDateB) {
+          return safeDateB - safeDateA;
+        }
+
+        return (a.learner.name || '').localeCompare(b.learner.name || '');
+      }),
+    [filteredReviews]
+  );
   const displayedReviews = useMemo(
-    () => (isChecklistMatrixPage ? filteredReviews : filteredReviews.slice(0, 5)),
-    [filteredReviews, isChecklistMatrixPage]
+    () => (isChecklistMatrixPage ? sortedFilteredReviews : sortedFilteredReviews.slice(0, 5)),
+    [sortedFilteredReviews, isChecklistMatrixPage]
   );
   const shouldScrollReviews = isChecklistMatrixPage && displayedReviews.length > 10;
 

@@ -50,7 +50,26 @@ def _safe_identifier(value):
     return f'"{str(value).replace(chr(34), chr(34) * 2)}"'
 
 
+def _uses_postgres():
+    return connection.vendor == "postgresql"
+
+
+def _empty_live_data_payload(**extra):
+    return {
+        "ok": True,
+        "status": 200,
+        "payload": {
+            "table": None,
+            "sourceAvailable": False,
+            **extra,
+        },
+    }
+
+
 def _find_summary_table():
+    if not _uses_postgres():
+        return None
+
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -88,6 +107,43 @@ def _coerce_text(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _parse_json_object(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+
+    text = value.strip()
+    if not text:
+        return {}
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _unwrap_summary_payload(value):
+    summary = _parse_json_object(value)
+    raw_value = summary.get("raw") if isinstance(summary, dict) else None
+    raw_summary = _parse_json_object(raw_value)
+    if raw_summary:
+        return raw_summary
+    if set(summary.keys()) == {"raw"}:
+        return {}
+    return summary
+
+
+def _summary_from_values(summary_json_value=None, summary_text_value=None):
+    for value in (summary_json_value, summary_text_value):
+        summary = _unwrap_summary_payload(value)
+        if summary:
+            return summary
+    return {}
 
 
 def _to_number(value):
@@ -182,6 +238,9 @@ def _review_state_from_kbc_row(last_review_value, planned_values, status_values)
 
 
 def _find_kbc_progress_table():
+    if not _uses_postgres():
+        return None
+
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -232,11 +291,22 @@ def _find_kbc_progress_table():
 
 
 def _fetch_otj_snapshot(learner_name="", learner_email="", programme=""):
-    table_name = "PR_BOOKING_SUMMERIES"
+    table_name = _find_summary_table()
+    if not table_name:
+        return {
+            "ok": False,
+            "status": 404,
+            "payload": {
+                "error": "Summary table was not found",
+                "expectedTable": SUMMARY_TABLE_NAME,
+            },
+        }
+
     query = f'SELECT * FROM public."{table_name}"'
     filters = []
     params = []
     matched_by = []
+    start_date_col = None
 
     if learner_email:
         filters.append('LOWER("Learner_Email") = LOWER(%s)')
@@ -280,12 +350,7 @@ def _fetch_otj_snapshot(learner_name="", learner_email="", programme=""):
         columns = [col[0] for col in cursor.description]
         record = dict(zip(columns, row))
 
-    summary_obj = record.get("summary_json") or {}
-    if not summary_obj and record.get("summary_text"):
-        try:
-            summary_obj = json.loads(record["summary_text"])
-        except json.JSONDecodeError:
-            summary_obj = {}
+    summary_obj = _summary_from_values(record.get("summary_json"), record.get("summary_text"))
 
     planned_value = _to_number(record.get("Planned"))
     submitted_value = _to_number(record.get("Submitted"))
@@ -634,6 +699,9 @@ def _norm_booking_identity(value):
 
 
 def _find_aptem_next_review_source():
+    if not _uses_postgres():
+        return None
+
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -868,20 +936,8 @@ def _summary_requires_zero_duration(summary_value, summary_text_value=None):
     if not _summary_has_transcript_evidence(summary_value, summary_text_value):
         return True
 
-    parsed = summary_value
-    if isinstance(parsed, str):
-        try:
-            parsed = json.loads(parsed)
-        except json.JSONDecodeError:
-            parsed = None
-
-    if not parsed and isinstance(summary_text_value, str):
-        try:
-            parsed = json.loads(summary_text_value)
-        except json.JSONDecodeError:
-            parsed = None
-
-    if not isinstance(parsed, dict):
+    parsed = _summary_from_values(summary_value, summary_text_value)
+    if not parsed:
         return False
 
     qa_entries = parsed.get("qa")
@@ -922,23 +978,12 @@ def _summary_requires_zero_duration(summary_value, summary_text_value=None):
 
 
 def _summary_has_transcript_evidence(summary_value, summary_text_value=None):
-    parsed = summary_value
-    if isinstance(parsed, str):
-        try:
-            parsed = json.loads(parsed)
-        except json.JSONDecodeError:
-            parsed = None
-
+    parsed = _summary_from_values(summary_value, summary_text_value)
     raw_text_candidates = []
     if isinstance(summary_text_value, str):
         raw_text_candidates.append(summary_text_value.strip())
-        if not parsed:
-            try:
-                parsed = json.loads(summary_text_value)
-            except json.JSONDecodeError:
-                parsed = None
 
-    if isinstance(parsed, dict):
+    if parsed:
         candidate_parts = []
         for key in ("executive_summary", "professional_judgement", "professionalJudgement"):
             value = parsed.get(key)
@@ -999,20 +1044,8 @@ def _summary_is_fully_not_evidenced(summary_value, summary_text_value=None):
     if _summary_requires_zero_duration(summary_value, summary_text_value):
         return True
 
-    parsed = summary_value
-    if isinstance(parsed, str):
-        try:
-            parsed = json.loads(parsed)
-        except json.JSONDecodeError:
-            parsed = None
-
-    if not parsed and isinstance(summary_text_value, str):
-        try:
-            parsed = json.loads(summary_text_value)
-        except json.JSONDecodeError:
-            parsed = None
-
-    if not isinstance(parsed, dict):
+    parsed = _summary_from_values(summary_value, summary_text_value)
+    if not parsed:
         return False
 
     qa_entries = parsed.get("qa")
@@ -1150,6 +1183,9 @@ def _overall_judgement_from_summary(summary_obj):
 def _fetch_summary_items(limit):
     table_name = _find_summary_table()
     if not table_name:
+        if not _uses_postgres():
+            return _empty_live_data_payload(total=0, count=0, items=[])
+
         return {
             "ok": False,
             "status": 404,
@@ -1225,12 +1261,7 @@ def _fetch_summary_items(limit):
     items = []
     for idx, row in enumerate(rows, start=1):
         summary_text = row[0]
-        parsed_summary = None
-        if isinstance(summary_text, str):
-            try:
-                parsed_summary = json.loads(summary_text)
-            except json.JSONDecodeError:
-                parsed_summary = None
+        parsed_summary = _summary_from_values(summary_text)
         items.append(
             {
                 "id": idx,
@@ -1443,6 +1474,9 @@ def _checklist_from_summary(summary_obj):
 def _fetch_completed_progress_reviews(limit):
     table_name = _find_summary_table()
     if not table_name:
+        if not _uses_postgres():
+            return _empty_live_data_payload(reviews=[])
+
         return {
             "ok": False,
             "status": 404,
@@ -1561,17 +1595,7 @@ def _fetch_completed_progress_reviews(limit):
             expected_otj_col_value,
             otj_hours_status_col_value,
         ) = row
-        summary_obj = {}
-        if summary_json_text:
-            try:
-                summary_obj = json.loads(summary_json_text)
-            except json.JSONDecodeError:
-                summary_obj = {}
-        if not summary_obj and isinstance(summary_text, str):
-            try:
-                summary_obj = json.loads(summary_text)
-            except json.JSONDecodeError:
-                summary_obj = {}
+        summary_obj = _summary_from_values(summary_json_text, summary_text)
 
         review_date = _safe_date(summary_obj.get("date")) or datetime.utcnow().date()
         meeting_date = review_date
@@ -1712,6 +1736,9 @@ def _fetch_completed_progress_reviews(limit):
 
 
 def _fetch_latest_booking_sessions(limit):
+    if not _uses_postgres():
+        return {"ok": True, "status": 200, "payload": {"table": None, "bookings": []}}
+
     with connection.cursor() as cursor:
         cursor.execute(
             """
@@ -1773,26 +1800,18 @@ def _fetch_latest_booking_sessions(limit):
 
 
 def _fetch_coach_transcript_stats(coach_name=None, date_from=None, date_to=None):
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                FROM information_schema.tables
-                WHERE table_schema = 'public'
-                  AND lower(table_name) = lower(%s)
-            )
-            """,
-            [SUMMARY_TABLE_NAME],
-        )
-        summary_table_exists = bool(cursor.fetchone()[0])
-        if not summary_table_exists:
-            return {
-                "ok": False,
-                "status": 404,
-                "payload": {"error": "Summary table was not found", "expectedTable": SUMMARY_TABLE_NAME},
-            }
+    table_name = _find_summary_table()
+    if not table_name:
+        if not _uses_postgres():
+            return _empty_live_data_payload(summaryTable=None, rows=[])
 
+        return {
+            "ok": False,
+            "status": 404,
+            "payload": {"error": "Summary table was not found", "expectedTable": SUMMARY_TABLE_NAME},
+        }
+
+    with connection.cursor() as cursor:
         filters = [
             "(summary_json IS NOT NULL OR (summary_text IS NOT NULL AND BTRIM(summary_text) <> ''))",
         ]
@@ -1817,17 +1836,7 @@ def _fetch_coach_transcript_stats(coach_name=None, date_from=None, date_to=None)
 
     aggregated = {}
     for row_id, booking_id, summary_json_text, summary_text_value in raw_rows:
-        summary_obj = {}
-        if summary_json_text:
-            try:
-                summary_obj = json.loads(summary_json_text)
-            except json.JSONDecodeError:
-                summary_obj = {}
-        if not summary_obj and isinstance(summary_text_value, str):
-            try:
-                summary_obj = json.loads(summary_text_value)
-            except json.JSONDecodeError:
-                summary_obj = {}
+        summary_obj = _summary_from_values(summary_json_text, summary_text_value)
 
         normalized_coach = (summary_obj.get("coach") or "").strip()
         meeting_date = _safe_date(summary_obj.get("date"))
